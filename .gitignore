@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+venv/
+.venv/
+env/
+
+# Logs / runtime
+*.log
+logs/
+tmp/
+
+# Editor/OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Local secrets / config
+.env
+*.env
+config_local*.json
+secrets*.json
+*token*
+*apikey*
+*api_key*
+
+# Archives / dropped bundles
+*.zip
+files*.zip
+files*/
+
+# Swarm runtime artifacts (usually not source)
+metrics/
+sessions/
+workspaces/

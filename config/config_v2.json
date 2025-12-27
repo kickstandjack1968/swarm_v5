@@ -1,0 +1,244 @@
+{
+  "model_config": {
+    "mode": "multi",
+    "single_model": {
+      "url": "http://localhost:11434",
+      "model": "qwen/qwen3-coder-30b",
+      "api_type": "ollama",
+      "timeout": 7200
+    },
+    "multi_model": {
+      "architect": {
+        "url": "http://localhost:1234/v1",
+        "model": "qwen/qwen3-coder-30b",
+        "model_name": "Lm Studio qwen/qwen3-coder-30b (Architect)",
+        "api_type": "openai",
+        "timeout": 7200
+      },
+      "clarifier": {
+        "url": "http://localhost:1234/v1",
+        "model": "qwen/qwen3-coder-30b",
+        "model_name": "LM Studio qwen/qwen3-coder-30b (Clarifier)",
+        "api_type": "openai",
+        "timeout": 7200
+      },
+      "coder": {
+        "url": "http://localhost:1234/v1",
+        "model": "qwen/qwen3-coder-30b",
+        "model_name": "LM Studio qwen/qwen3-coder-30b (Coder)",
+        "api_type": "openai",
+        "timeout": 7200
+      },
+      "verifier": {
+        "url": "http://localhost:1234/v1",
+        "model": "qwen/qwen3-coder-30b",
+        "model_name": "LM Studio qwen/qwen3-coder-30b (Verifier)",
+        "api_type": "openai",
+        "timeout": 7200
+      },
+      "reviewer": {
+        "url": "http://localhost:1234/v1",
+        "model": "qwen/qwen3-coder-30b",
+        "model_name": "qwen/qwen3-coder-30b (Reviewer)",
+        "api_type": "openai",
+        "timeout": 7200
+      },
+      "tester": {
+        "url": "http://localhost:1234/v1",
+        "model": "qwen/qwen3-coder-30b",
+        "model_name": "qwen/qwen3-coder-30b (Tester)",
+        "api_type": "openai",
+        "timeout": 7200
+      },
+      "optimizer": {
+        "url": "http://localhost:1234/v1",
+        "model": "qwen/qwen3-coder-30b",
+        "model_name": "LM Studio qwen/qwen3-coder-30b (Optimizer)",
+        "api_type": "openai",
+        "timeout": 7200
+      },
+      "documenter": {
+        "url": "http://localhost:1234/v1",
+        "model": "qwen/qwen3-coder-30b",
+        "model_name": "qwen/qwen3-coder-30b (Documenter)",
+        "api_type": "openai",
+        "timeout": 7200
+      },
+      "debugger": {
+        "url": "http://localhost:1234/v1",
+        "model": "qwen/qwen3-coder-30b",
+        "model_name": "qwen2.5-coder-32b-instruct(Debugger)",
+        "api_type": "openai",
+        "timeout": 7200
+      },
+      "security": {
+        "url": "http://localhost:1234/v1",
+        "model": "qwen2.5-coder-32b-instruct",
+        "model_name": "qwen2.5-coder-32b-instruct(Security)",
+        "api_type": "openai",
+        "timeout": 7200
+      },
+      "fallback_coder": {
+          "url": "http://localhost:1234/v1",
+          "model": "qwen2.5-coder-32b-instruct",
+          "model_name": "qwen2.5-coder-32b-instruct(Security)",
+          "api_type": "openai",
+          "timeout": 7200
+        },
+      "arbitrator": {
+        "url": "http://localhost:1234/v1",
+        "model": "qwen/qwen3-coder-30b",
+        "model_name": "qwen/qwen3-coder-30b (Arbitrator)",
+        "api_type": "openai",
+        "timeout": 7200
+      }
+    }
+  },
+  "agent_parameters": {
+    "architect": {
+      "temperature": 0.5,
+      "max_tokens": 25000,
+      "top_p": 0.85
+    },    
+    "fallback_coder": {
+      "temperature": 0.7,
+      "max_tokens": 25000,
+      "top_p": 0.85
+    },
+    "clarifier": {
+      "temperature": 0.7,
+      "max_tokens": 25000,
+      "top_p": 0.9
+    },
+    "coder": {
+      "temperature": 0.2,
+      "max_tokens": 25000,
+      "top_p": 0.85
+    },
+    "reviewer": {
+      "temperature": 0.8,
+      "max_tokens": 25000,
+      "top_p": 0.95,
+      "adversarial_mode": true
+    },
+    "tester": {
+      "temperature": 0.7,
+      "max_tokens": 25000,
+      "top_p": 0.9
+    },
+    "optimizer": {
+      "temperature": 0.6,
+      "max_tokens": 25000,
+      "top_p": 0.85
+    },
+    "verifier": {
+      "temperature": 0.3,
+      "max_tokens": 25000,
+      "top_p": 0.85
+    },
+    "documenter": {
+      "temperature": 0.7,
+      "max_tokens": 25000,
+      "top_p": 0.9
+    },
+    "debugger": {
+      "temperature": 0.6,
+      "max_tokens": 25000,
+      "top_p": 0.85
+    },
+    "security": {
+      "temperature": 0.8,
+      "max_tokens": 25000,
+      "top_p": 0.95
+    },
+    "arbitrator": {
+      "temperature": 0.25,
+      "max_tokens": 4000,
+      "top_p": 0.85
+    }
+  },
+  "workflow": {
+    "max_iterations": 3,
+    "max_parallel_agents": 1,
+    "enable_parallel": false,
+    "auto_approve_clear_requirements": false,
+    "save_session": true,
+    "verbose_logging": true
+  },
+  "smoke_test": {
+    "enabled": true,
+    "timeout": 60,
+    "fail_on_syntax_error": true,
+    "fail_on_test_failure": true,
+    "fail_on_import_error": true,
+    "max_files_warning": 100
+  },
+  "agents": {
+    "clarifier": {
+      "max_questions": 4,
+      "focus_areas": [
+        "Input/output formats",
+        "Edge cases and error handling",
+        "Dependencies or environment",
+        "Scale/performance expectations"
+      ]
+    },
+    "coder": {
+      "require_comments": true,
+      "require_error_handling": true,
+      "require_usage_example": true
+    },
+    "reviewer": {
+      "check_correctness": true,
+      "check_bugs": true,
+      "check_quality": true,
+      "check_security": true,
+      "check_completeness": true
+    },
+    "tester": {
+      "include_unit_tests": true,
+      "include_integration_tests": true,
+      "include_edge_cases": true
+    },
+    "verifier": {
+      "check_documentation": true,
+      "check_code_match": true,
+      "check_deliverables": true,
+      "check_user_acceptance": true,
+      "strict_mode": true
+    },
+    "security": {
+      "check_injection": true,
+      "check_validation": true,
+      "check_authentication": true,
+      "check_encryption": true
+    },
+    "arbitrator": {
+      "max_review_rounds": 2,
+      "require_rationale": true,
+      "strict_mode": true
+    }
+  },
+  "negotiation": {
+    "enabled": true,
+    "max_rounds": 2,
+    "save_log": true
+  },
+  "output": {
+    "save_code_file": true,
+    "code_filename": "generated_code.txt",
+    "save_tests_file": true,
+    "tests_filename": "generated_tests.txt",
+    "save_docs_file": true,
+    "docs_filename": "generated_docs.txt",
+    "session_filename": "swarm_session.json",
+    "log_filename": "swarm_workflow.log"
+  },
+  "features": {
+    "enable_streaming": false,
+    "enable_tool_calling": false,
+    "enable_memory": true,
+    "enable_checkpointing": true
+  }
+}
+
