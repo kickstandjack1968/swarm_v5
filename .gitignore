@@ -30,3 +30,10 @@ tmp/
 .env
 *.key
 *.pem
+
+# Swarm-generated artifacts
+workspaces/
+sessions/
+logs/
+metrics/
+*.db
