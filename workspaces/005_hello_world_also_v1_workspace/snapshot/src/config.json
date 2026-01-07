@@ -1,0 +1,14 @@
+{
+    "color": "red"
+}
+
+
+### Usage Example ###
+# 1. Ensure the script and config.json are in the same directory.
+# 2. Run the program:
+#        python hello_world.py
+#
+# The terminal will display the current year centered above a colored
+# “Hello, World!” line. Each execution appends a timestamped entry to
+# app.log. If config.json is missing or contains an unsupported color,
+# the program defaults to red and logs a warning.

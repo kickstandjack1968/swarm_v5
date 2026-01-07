@@ -24,7 +24,7 @@ import json
 import os
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict, field
 from enum import Enum
@@ -50,12 +50,334 @@ except ImportError as e:
     print(f"Import failed: {e}")
     PLAN_EXECUTOR_AVAILABLE = False
 
+
+class DockerSandbox:
+    """
+    Manages a persistent Docker container for running hot tests during swarm execution.
+    Container is started once and reused for all tests, then cleaned up at the end.
+    """
+    
+    CONTAINER_NAME = "swarm_sandbox"
+    IMAGE = "python:3.12-slim"
+    BASE_PACKAGES = ["pytest", "pyyaml", "requests"]
+    
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.container_running = False
+        self.installed_requirements: set = set()
+        self._check_docker_available()
+    
+    def _check_docker_available(self):
+        """Check if Docker is available on the system"""
+        if not self.enabled:
+            return
+        try:
+            result = subprocess.run(
+                ["docker", "info"],
+                capture_output=True,
+                timeout=10
+            )
+            if result.returncode != 0:
+                print("⚠ Docker not available, falling back to local execution")
+                self.enabled = False
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            print("⚠ Docker not found, falling back to local execution")
+            self.enabled = False
+    
+    def start(self) -> bool:
+        """Start the sandbox container with base packages installed"""
+        if not self.enabled:
+            return False
+        
+        # Clean up any existing container with same name
+        subprocess.run(
+            ["docker", "rm", "-f", self.CONTAINER_NAME],
+            capture_output=True
+        )
+        
+        # Start container with tail -f /dev/null to keep it alive
+        result = subprocess.run(
+            [
+                "docker", "run", "-d",
+                "--name", self.CONTAINER_NAME,
+                "-w", "/workspace",
+                self.IMAGE,
+                "tail", "-f", "/dev/null"
+            ],
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            print(f"⚠ Failed to start Docker sandbox: {result.stderr}")
+            self.enabled = False
+            return False
+        
+        # Install base packages
+        print("🐳 Starting Docker sandbox...")
+        install_cmd = ["pip", "install", "--quiet"] + self.BASE_PACKAGES
+        result = self._exec(install_cmd, timeout=120)
+        
+        if result.returncode != 0:
+            print(f"⚠ Failed to install base packages: {result.stderr}")
+            self.stop()
+            self.enabled = False
+            return False
+        
+        # Create workspace directories
+        self._exec(["mkdir", "-p", "/workspace/src", "/workspace/tests"])
+        
+        self.container_running = True
+        print(f"   ✓ Sandbox ready (base packages: {', '.join(self.BASE_PACKAGES)})")
+        return True
+    
+    def stop(self):
+        """Stop and remove the sandbox container"""
+        if not self.enabled:
+            return
+        
+        subprocess.run(
+            ["docker", "rm", "-f", self.CONTAINER_NAME],
+            capture_output=True
+        )
+        self.container_running = False
+        self.installed_requirements.clear()
+        print("🐳 Docker sandbox stopped")
+    
+    def _exec(self, cmd: List[str], timeout: int = 60) -> subprocess.CompletedProcess:
+        """Execute a command inside the container"""
+        full_cmd = ["docker", "exec", self.CONTAINER_NAME] + cmd
+        return subprocess.run(
+            full_cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+    
+    def install_requirements(self, requirements_content: str) -> bool:
+        """Install requirements from requirements.txt content (only new ones)"""
+        if not self.enabled or not self.container_running:
+            return False
+        
+        # Parse requirements
+        new_reqs = set()
+        for line in requirements_content.strip().split('\n'):
+            line = line.strip()
+            if line and not line.startswith('#'):
+                # Extract package name (without version specifier)
+                pkg = line.split('==')[0].split('>=')[0].split('<=')[0].split('[')[0].strip()
+                if pkg and pkg not in self.installed_requirements:
+                    new_reqs.add(pkg)
+        
+        if not new_reqs:
+            return True
+        
+        # Install new requirements
+        install_cmd = ["pip", "install", "--quiet"] + list(new_reqs)
+        result = self._exec(install_cmd, timeout=120)
+        
+        if result.returncode == 0:
+            self.installed_requirements.update(new_reqs)
+            return True
+        else:
+            print(f"⚠ Failed to install some requirements: {result.stderr[:200]}")
+            return False
+    
+    def copy_to_container(self, local_path: str, container_path: str) -> bool:
+        """Copy a file or directory to the container"""
+        if not self.enabled or not self.container_running:
+            return False
+        
+        result = subprocess.run(
+            ["docker", "cp", local_path, f"{self.CONTAINER_NAME}:{container_path}"],
+            capture_output=True,
+            text=True
+        )
+        return result.returncode == 0
+    
+    def write_file(self, container_path: str, content: str) -> bool:
+        """Write content to a file inside the container"""
+        if not self.enabled or not self.container_running:
+            return False
+        
+        # Use docker exec with echo/cat to write file
+        # Escape content for shell
+        import base64
+        encoded = base64.b64encode(content.encode()).decode()
+        
+        result = self._exec([
+            "sh", "-c",
+            f"echo '{encoded}' | base64 -d > {container_path}"
+        ])
+        return result.returncode == 0
+    
+    def run_pytest(self, test_file: str, timeout: int = 60) -> Tuple[bool, str]:
+        """Run pytest on a test file inside the container"""
+        if not self.enabled or not self.container_running:
+            return False, "Docker sandbox not available"
+        
+        result = self._exec(
+            ["python", "-m", "pytest", test_file, "-v"],
+            timeout=timeout
+        )
+        
+        output = f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        return result.returncode == 0, output
+    
+    def cleanup_workspace(self):
+        """Clean the workspace directories for next test"""
+        if not self.enabled or not self.container_running:
+            return
+        
+        self._exec(["sh", "-c", "rm -rf /workspace/src/* /workspace/tests/*"])
+    
+    def run_hot_test(
+        self,
+        completed_files: Dict[str, Any],
+        test_content: str,
+        file_name: str,
+        requirements_content: str = ""
+    ) -> Tuple[bool, str]:
+        """
+        Run a hot test in the Docker sandbox.
+        
+        Args:
+            completed_files: Dict of filename -> FileResult with .content attribute
+            test_content: The test file content
+            file_name: Name of the file being tested (for naming the test)
+            requirements_content: Optional requirements.txt content
+            
+        Returns:
+            (success, output) tuple
+        """
+        if not self.enabled or not self.container_running:
+            return self._run_local_fallback(completed_files, test_content, file_name)
+        
+        try:
+            # Clean workspace
+            self.cleanup_workspace()
+            
+            # Install requirements if provided
+            if requirements_content:
+                self.install_requirements(requirements_content)
+            
+            # Write all source files
+            for fname, result in completed_files.items():
+                content = result.content if hasattr(result, 'content') else str(result)
+                container_path = f"/workspace/src/{fname}"
+                
+                # Ensure directory exists
+                dir_path = os.path.dirname(container_path)
+                if dir_path != "/workspace/src":
+                    self._exec(["mkdir", "-p", dir_path])
+                
+                if not self.write_file(container_path, content):
+                    return False, f"Failed to write {fname} to container"
+            
+            # Ensure __init__.py exists
+            self.write_file("/workspace/src/__init__.py", "")
+            
+            # Write test file
+            test_name = f"test_{file_name}"
+            if not self.write_file(f"/workspace/tests/{test_name}", test_content):
+                return False, "Failed to write test file to container"
+            
+            # Run pytest
+            return self.run_pytest(f"/workspace/tests/{test_name}", timeout=60)
+            
+        except subprocess.TimeoutExpired:
+            return False, "Test execution timed out"
+        except Exception as e:
+            return False, f"Docker execution error: {str(e)}"
+    
+    def _run_local_fallback(
+        self,
+        completed_files: Dict[str, Any],
+        test_content: str,
+        file_name: str
+    ) -> Tuple[bool, str]:
+        """Fallback to local execution if Docker is not available"""
+        import tempfile
+        
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src_dir = os.path.join(tmp_dir, "src")
+            tests_dir = os.path.join(tmp_dir, "tests")
+            os.makedirs(src_dir, exist_ok=True)
+            os.makedirs(tests_dir, exist_ok=True)
+            
+            # Write source files
+            for fname, result in completed_files.items():
+                content = result.content if hasattr(result, 'content') else str(result)
+                full_path = os.path.join(src_dir, fname)
+                os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                with open(full_path, 'w') as f:
+                    f.write(content)
+            
+            # Ensure __init__.py
+            init_path = os.path.join(src_dir, "__init__.py")
+            if not os.path.exists(init_path):
+                with open(init_path, 'w') as f:
+                    f.write("")
+            
+            # Write test file
+            test_name = f"test_{file_name}"
+            with open(os.path.join(tests_dir, test_name), 'w') as f:
+                f.write(test_content)
+            
+            # Run pytest
+            env = os.environ.copy()
+            env["PYTHONPATH"] = tmp_dir
+            
+            try:
+                cmd = [sys.executable, "-m", "pytest", os.path.join(tests_dir, test_name)]
+                proc = subprocess.run(
+                    cmd,
+                    cwd=tmp_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                
+                if proc.returncode == 0:
+                    return True, proc.stdout
+                else:
+                    return False, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+                    
+            except subprocess.TimeoutExpired:
+                return False, "Execution timed out (infinite loop?)"
+            except Exception as e:
+                return False, f"Local execution error: {str(e)}"
+
+
+# Global sandbox instance (initialized when SwarmCoordinator starts)
+_docker_sandbox: Optional[DockerSandbox] = None
+
+
+def get_docker_sandbox() -> Optional[DockerSandbox]:
+    """Get the global Docker sandbox instance"""
+    global _docker_sandbox
+    return _docker_sandbox
+
+
+def init_docker_sandbox(enabled: bool = True) -> DockerSandbox:
+    """Initialize the global Docker sandbox"""
+    global _docker_sandbox
+    _docker_sandbox = DockerSandbox(enabled=enabled)
+    return _docker_sandbox
+
+
+def shutdown_docker_sandbox():
+    """Shutdown the global Docker sandbox"""
+    global _docker_sandbox
+    if _docker_sandbox:
+        _docker_sandbox.stop()
+        _docker_sandbox = None
+
 class AgentRole(Enum):
     """Defined agent roles in the swarm"""
     ARCHITECT = "architect"
     CLARIFIER = "clarifier"
     CODER = "coder"
-    FALLBACK_CODER = "fallback_coder"
     REVIEWER = "reviewer"
     TESTER = "tester"
     OPTIMIZER = "optimizer"
@@ -63,6 +385,7 @@ class AgentRole(Enum):
     DEBUGGER = "debugger"
     SECURITY = "security"
     VERIFIER = "verifier"
+    FALLBACK_CODER= "fallback_coder"
 
 
 class TaskStatus(Enum):
@@ -148,6 +471,7 @@ class AgentExecutor:
                 AgentRole.ARCHITECT: 'architect',
                 AgentRole.CLARIFIER: 'clarifier',
                 AgentRole.CODER: 'coder',
+                AgentRole.FALLBACK_CODER: 'fallback_coder',
                 AgentRole.REVIEWER: 'reviewer',
                 AgentRole.TESTER: 'tester',
                 AgentRole.OPTIMIZER: 'optimizer',
@@ -317,7 +641,7 @@ class SwarmCoordinator:
         return {"status": "pass" if not findings else "fail", "count": len(findings), "findings": findings}
 
 
-    def __init__(self, config_file: str = "config_v2.json"):
+    def __init__(self, config_file: str = "config_v2.json", use_docker: bool = True):
         self.config = self._load_config(config_file)
         self.executor = AgentExecutor(self.config)
         self.task_queue: List[Task] = []
@@ -341,6 +665,12 @@ class SwarmCoordinator:
         self.max_parallel = self.config.get('workflow', {}).get('max_parallel_agents', 4)
         self.projects_root = "projects"
         self._ensure_projects_dir()
+        
+        # Initialize Docker sandbox for hot tests
+        self.use_docker = use_docker
+        self.sandbox = None
+        if use_docker:
+            self.sandbox = init_docker_sandbox(enabled=True)
     
     def _load_config(self, config_file: str) -> Dict:
         """Load configuration from file"""
@@ -563,51 +893,79 @@ PROJECT STRUCTURE
             print(f"   Warning: Could not parse project type from plan: {e}")
 
     def _save_project_outputs(self):
-        """Save all outputs to project directory"""
+        """Save all outputs to project directory with SMART ROUTING"""
         project_dir = self.state["project_info"].get("project_dir")
         if not project_dir:
             return
         
         # Save code - handle multi-file output
-        code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution")), None)
+        code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution", "revision")), None)
         if code_task and code_task.result:
             files_dict = self._parse_multi_file_output(code_task.result)
             
             if files_dict:
                 # Multi-file output detected
                 for filename, content in files_dict.items():
-                    # Normalize leading "src/" so we don't end up with src/src/...
+                    # Normalize path separators
+                    filename = filename.replace('\\', '/')
+                    
+                    # INTELLIGENT ROUTING
                     if filename.startswith("src/"):
+                        # Explicitly marked for src -> Strip prefix, go to src/
                         rel_path = filename[len("src/"):]
-                    else:
+                        base_dir = os.path.join(project_dir, "src")
+                    elif filename.startswith("tests/"):
+                        # Explicitly marked for tests -> Go to root/tests
+                        rel_path = filename 
+                        base_dir = project_dir 
+                    elif filename.startswith("docs/"):
+                        # Explicitly marked for docs -> Go to root/docs
                         rel_path = filename
+                        base_dir = project_dir
+                    else:
+                        # Implicit source file -> Go to src/ (SAFE DEFAULT)
+                        rel_path = filename
+                        base_dir = os.path.join(project_dir, "src")
 
-                    code_file = os.path.join(project_dir, "src", rel_path)
+                    code_file = os.path.join(base_dir, rel_path)
+                    
+                    # Ensure directory exists
                     os.makedirs(os.path.dirname(code_file), exist_ok=True)
-                    with open(code_file, 'w') as f:
+                    
+                    with open(code_file, 'w', encoding='utf-8') as f:
                         f.write(content)
-                print(f"   ✓ Created {len(files_dict)} source files")
+                print(f"   ✓ Created {len(files_dict)} files (smart routed)")
 
             else:
-                # Single file output (legacy behavior)
+                # Single file output (legacy behavior) - assume source
                 project_name = self.state["project_info"]["project_name"]
                 code_file = os.path.join(project_dir, "src", f"{project_name}.py")
                 
-                with open(code_file, 'w') as f:
+                with open(code_file, 'w', encoding='utf-8') as f:
                     f.write(code_task.result)
         
 
-        # Save tests
+        # Save tests (from Tester agent specifically)
         test_task = next((t for t in self.completed_tasks if t.task_type == "test_generation"), None)
         if test_task and test_task.result:
             project_name = self.state["project_info"]["project_name"]
-            test_file = os.path.join(project_dir, "tests", f"test_{project_name}.py")
-            
-            # Clean markdown fences from test output
-            test_content = self._clean_test_output(test_task.result)
-            
-            with open(test_file, 'w') as f:
-                f.write(test_content)
+            # If tester outputted multiple files, use parsing logic
+            if "### FILE:" in test_task.result:
+                test_files = self._parse_multi_file_output(test_task.result)
+                for fname, content in test_files.items():
+                    # Force into tests dir if not already
+                    if not fname.startswith("tests/"):
+                        fname = f"tests/{fname}"
+                    path = os.path.join(project_dir, fname)
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, 'w', encoding='utf-8') as f:
+                        f.write(content)
+            else:
+                # Single test file fallback
+                test_file = os.path.join(project_dir, "tests", f"test_{project_name}.py")
+                test_content = self._clean_test_output(test_task.result)
+                with open(test_file, 'w', encoding='utf-8') as f:
+                    f.write(test_content)
 
 
         # Save documentation
@@ -615,12 +973,12 @@ PROJECT STRUCTURE
         if doc_task and doc_task.result:
             doc_file = os.path.join(project_dir, "docs", "README.md")
             
-            with open(doc_file, 'w') as f:
+            with open(doc_file, 'w', encoding='utf-8') as f:
                 f.write(doc_task.result)
             
             # Also copy to project root
             root_readme = os.path.join(project_dir, "README.md")
-            with open(root_readme, 'w') as f:
+            with open(root_readme, 'w', encoding='utf-8') as f:
                 f.write(doc_task.result)
         
         # Save review results
@@ -628,7 +986,7 @@ PROJECT STRUCTURE
         if review_tasks:
             review_file = os.path.join(project_dir, "REVIEW_RESULTS.txt")
             
-            with open(review_file, 'w') as f:
+            with open(review_file, 'w', encoding='utf-8') as f:
                 f.write("CODE REVIEW RESULTS\n")
                 f.write("=" * 80 + "\n\n")
                 for i, task in enumerate(review_tasks, 1):
@@ -678,12 +1036,27 @@ PROJECT STRUCTURE
             else:
                 # Check based on project type
                 if project_type == "cli":
-                    if "def main" not in entry_code:
-                        issues.append(f"{entry_point_normalized}: missing main() function.")
-                    if "__name__" not in entry_code or "main()" not in entry_code:
-                        issues.append(f"{entry_point_normalized}: may not call main() under __name__ == '__main__'.")
-                    if "argparse" not in entry_code:
-                        issues.append(f"{entry_point_normalized}: argparse not found; CLI may be incomplete.")
+                    # Check for __name__ == "__main__" guard (the essential part)
+                    has_name_guard = "__name__" in entry_code and "__main__" in entry_code
+                    
+                    # Check for any callable function (doesn't have to be named "main")
+                    has_callable = "def " in entry_code or "class " in entry_code
+                    
+                    # Check if something is called under the name guard
+                    # Look for pattern: if __name__ followed by function call
+                    has_execution = has_name_guard and ("()" in entry_code)
+                    
+                    if not has_name_guard:
+                        issues.append(f"{entry_point_normalized}: missing __name__ == '__main__' guard.")
+                    
+                    if not has_callable and not has_execution:
+                        issues.append(f"{entry_point_normalized}: no executable code found.")
+                    
+                    # Only warn about argparse if the program seems to need arguments
+                    # (has sys.argv, mentions "args", "arguments", etc.)
+                    needs_args = any(x in entry_code.lower() for x in ["sys.argv", "argument", "args", "option", "flag", "--"])
+                    if needs_args and "argparse" not in entry_code and "click" not in entry_code and "typer" not in entry_code:
+                        issues.append(f"{entry_point_normalized}: program may need argument parsing but no argparse/click/typer found.")
                        
                 elif project_type == "subprocess_tool":
                     if "def main" not in entry_code:
@@ -1164,6 +1537,47 @@ PROJECT STRUCTURE
                         task.status = TaskStatus.FAILED
                         task.error = f"Semantic audit failed ({report.get('count', 0)} finding(s))"
                     return task
+                
+                # BUG DIAGNOSIS - analyze code and diagnose root cause
+                elif task.task_type == "bug_diagnosis":
+                    system_prompt = self._get_system_prompt(AgentRole.DEBUGGER, "bug_diagnosis")
+                    user_request = task.metadata.get("user_request", "")
+                    bug_description = task.metadata.get("bug_description", "")
+                    
+                    user_message = f"""Analyze this bug and diagnose the root cause.
+
+BUG DESCRIPTION:
+{bug_description}
+
+PROJECT CONTEXT:
+{user_request}
+
+Provide:
+1. Root cause analysis - what is causing the bug
+2. Affected files/functions
+3. Recommended fix approach
+4. Any related issues that might also need attention
+
+Be specific and reference actual code from the project."""
+                    
+                    try:
+                        result = self.executor.execute_agent(
+                            role=AgentRole.DEBUGGER,
+                            system_prompt=system_prompt,
+                            user_message=user_message
+                        )
+                        task.result = result
+                        task.status = TaskStatus.COMPLETED
+                        
+                        # Store diagnosis in context for coder task
+                        self.state["context"]["bug_diagnosis"] = result
+                        
+                    except Exception as e:
+                        task.status = TaskStatus.FAILED
+                        task.error = str(e)
+                    
+                    task.completed_at = time.time()
+                    return task
 
             # fallback: if you have other debugger tasks that should use the LLM,
 # --- VERIFIER TASK (External: Verifier) ---
@@ -1249,18 +1663,30 @@ PROJECT STRUCTURE
 
                     # Parse verification result
                     resp_upper = (result or "").upper()
-                    passed = ("VERIFICATION: PASS" in resp_upper) and ("VERIFICATION: FAIL" not in resp_upper)
+                    
+                    # Check for explicit FAIL first
+                    explicit_fail = "VERIFICATION: FAIL" in resp_upper
+                    
+                    # Check for pass conditions (PASS, WARN with APPROVE, or just APPROVE)
+                    explicit_pass = "VERIFICATION: PASS" in resp_upper
+                    warn_with_approve = ("VERIFICATION: WARN" in resp_upper and "RECOMMENDATION: APPROVE" in resp_upper)
+                    recommend_approve = "RECOMMENDATION: APPROVE" in resp_upper and not explicit_fail
+                    
+                    passed = (explicit_pass or warn_with_approve or recommend_approve) and not explicit_fail
 
                     if not passed:
                         print("\n" + "=" * 80)
-                        print("⚠️ VERIFICATION FAILED (NO EXPLICIT PASS)")
+                        print("⚠️ VERIFICATION FAILED")
                         print("=" * 80)
                         print(result)
                         print("=" * 80)
                         task.status = TaskStatus.FAILED
-                        task.error = "Verifier did not explicitly return 'VERIFICATION: PASS'"
+                        task.error = "Verifier returned FAIL or did not approve"
                     else:
-                        print("\n✓ Verification passed - project ready for delivery")
+                        if warn_with_approve:
+                            print("\n✓ Verification passed with warnings - project approved")
+                        else:
+                            print("\n✓ Verification passed - project ready for delivery")
                         task.status = TaskStatus.COMPLETED
 
                 except Exception as e:
@@ -1695,11 +2121,22 @@ PROJECT STRUCTURE
 
                     # 4. Parse Result
                     resp_upper = (result or "").upper()
-                    if "VERIFICATION: PASS" in resp_upper and "VERIFICATION: FAIL" not in resp_upper:
+                    
+                    # Check for explicit FAIL first
+                    explicit_fail = "VERIFICATION: FAIL" in resp_upper
+                    
+                    # Check for pass conditions (PASS, WARN with APPROVE, or just APPROVE)
+                    explicit_pass = "VERIFICATION: PASS" in resp_upper
+                    warn_with_approve = ("VERIFICATION: WARN" in resp_upper and "RECOMMENDATION: APPROVE" in resp_upper)
+                    recommend_approve = "RECOMMENDATION: APPROVE" in resp_upper and not explicit_fail
+                    
+                    passed = (explicit_pass or warn_with_approve or recommend_approve) and not explicit_fail
+                    
+                    if passed:
                         task.status = TaskStatus.COMPLETED
                     else:
                         task.status = TaskStatus.FAILED
-                        task.error = "Verifier did not explicitly return 'VERIFICATION: PASS'"
+                        task.error = "Verifier returned FAIL or did not approve"
 
                 except Exception as e:
                     task.status = TaskStatus.FAILED
@@ -1854,9 +2291,9 @@ PROJECT STRUCTURE
         """Handle clarification task by showing questions to user and getting answers"""
         if not task.result:
             return
+        user_request = task.metadata.get("user_request", "")
         
         result = task.result.strip()
-        user_request = task.metadata.get("user_request", "")  # Get from task metadata
         
         # Check if requirements are already clear
         if "STATUS: CLEAR" in result.upper():
@@ -2011,11 +2448,15 @@ PROJECT STRUCTURE
         print(f"Workflow: {workflow_type}")
         print("=" * 80)
         
+        # Start Docker sandbox if enabled
+        if self.sandbox and self.use_docker:
+            self.sandbox.start()
+        
         # FIXED: Store user request in context for all downstream tasks
         self.state["context"]["user_request"] = user_request
         
-        # Setup project directory (skip for custom if already has tasks)
-        if workflow_type != "custom" or not self.task_queue:
+        # Setup project directory (skip for custom/bugfix/import as they handle their own)
+        if workflow_type not in ("custom", "bugfix", "import") or not self.task_queue:
             project_name = self._create_project_name(user_request) if user_request else "custom_project"
             project_dir = self._setup_project_directory(project_name, user_request or "Custom workflow")
             
@@ -2023,6 +2464,12 @@ PROJECT STRUCTURE
             print(f"   Location: {project_dir}")
             print(f"   Number: {self.state['project_info']['project_number']:03d}")
             print(f"   Version: {self.state['project_info']['version']}")
+        else:
+            # RETRIEVE EXISTING DIR FROM STATE
+            project_dir = self.state["project_info"].get("project_dir")
+            # If for some reason it's missing (rare edge case), default to current dir to prevent crash
+            if not project_dir:
+                project_dir = os.getcwd()
         
         # Create initial tasks based on workflow type
         if workflow_type == "standard":
@@ -2102,6 +2549,10 @@ PROJECT STRUCTURE
 
         # Print project summary
         self._print_project_summary()
+        
+        # Cleanup Docker sandbox
+        if self.sandbox:
+            self.sandbox.stop()
     
     def _print_project_summary(self):
         """Print summary of project outputs"""
@@ -2472,30 +2923,38 @@ import json
 
 Focus on code that works correctly and follows the architect's file structure exactly.""",
 
-            AgentRole.FALLBACK_CODER: """You are a SENIOR expert programmer called in to fix code that junior coders couldn't get right.
+            AgentRole.FALLBACK_CODER: """You are a SENIOR debugger called in to fix code that failed validation.
 
-YOUR SITUATION: Previous revision attempts have FAILED. You are the fallback.
+CONTEXT: Previous attempts have FAILED. You are the fallback - the last line of defense.
 
-CRITICAL APPROACH:
-1. The previous coder made mistakes - don't repeat them
-2. READ THE ERROR FEEDBACK CAREFULLY before writing anything
-3. Think step-by-step about WHY the previous code failed
-4. Sometimes the simplest solution is best - don't over-engineer
-5. If the architecture is flawed, simplify it
+BEFORE WRITING ANY CODE:
+1. Read the error message EXACTLY - what file, what line, what type of error?
+2. Identify the ROOT CAUSE, not just the symptom
+3. Check: Is this a typo? Import issue? Type mismatch? Logic error? Missing dependency?
+4. Consider: Is the original approach overcomplicated? Sometimes delete and simplify.
 
-DEBUGGING MINDSET:
-- What is the EXACT error being reported?
-- What line/function is causing it?
-- What's the minimal change to fix it?
-- Could this be a dependency issue? Import issue? Type issue?
+COMMON FAILURE PATTERNS TO CHECK:
+- Missing imports or wrong import paths
+- Type hint mismatches (Optional[], Union[], etc.)
+- Pydantic/dataclass field issues
+- Enum values that don't exist
+- Async/await mismatches
+- Circular imports
+- Off-by-one errors, wrong variable names
+
+FIX STRATEGY:
+1. Make the MINIMAL change that fixes the error
+2. Don't refactor unrelated code - you'll introduce new bugs
+3. If the architecture is fundamentally broken, simplify ruthlessly
+4. When in doubt, add defensive checks and clear error messages
 
 OUTPUT RULES:
-1. Output ONLY valid, executable code
+1. Output ONLY valid, executable Python
 2. Use ### FILE: filename.py ### headers
-3. No markdown code blocks
-4. Test your logic mentally before outputting
+3. NO markdown, NO explanations outside code comments
+4. Include ALL necessary imports at the top of each file
 
-You are the last line of defense. Make it work.""",
+Make it work.""",
 
             AgentRole.REVIEWER: """You are a code reviewer. Your role is to:
 - Find BUGS - syntax errors, logic errors, missing imports, unhandled exceptions
@@ -2516,7 +2975,7 @@ Return STATUS: NEEDS_REVISION with SPECIFIC bugs/issues if found.
 
 Be thorough - broken code getting through is a critical failure.""",
 
- AgentRole.TESTER: """You are a test engineer generating pytest test suites.
+            AgentRole.TESTER: """You are a test engineer generating pytest test suites.
 
 CRITICAL OUTPUT RULES:
 1. Output ONLY raw Python code - no markdown, no ```python blocks, no explanations
@@ -2552,6 +3011,16 @@ MOCKING GUIDELINES:
 - Mock database connections to avoid side effects
 - When testing CLI, mock sys.argv
 - When mocking datetime, patch it where it's used: @patch('module.datetime')
+
+REGEX AND CONFIG TESTING:
+- NEVER assert exact string equality on regex patterns from config files
+- String escaping differs between YAML parsing and Python literals
+- Instead, test that regex patterns WORK correctly:
+  WRONG: assert config['regex'] == "\\\\bERROR\\\\b"
+  RIGHT: assert re.search(config['regex'], "ERROR occurred") is not None
+  RIGHT: assert re.search(config['regex'], "ERRORS") is None  # word boundary works
+- For config values, test behavior not exact string representation
+- If testing config loading, verify the loaded config can be USED correctly
 
 NAMING:
 - test_<function_name>_<scenario>

@@ -1,46 +1,32 @@
 # Python
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
+*.pyd
 *.egg-info/
 dist/
 build/
-.pytest_cache/
-.coverage
-htmlcov/
-.mypy_cache/
-.ruff_cache/
 
-# Virtual envs
-venv/
+# Virtualenvs
 .venv/
+venv/
 env/
 
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
 # Logs / runtime
-*.log
 logs/
+*.log
+session_state.json
+metrics/
 tmp/
 
-# Editor/OS
-.idea/
-.vscode/
-.DS_Store
-*.swp
-
-# Local secrets / config
+# Secrets
 .env
-*.env
-config_local*.json
-secrets*.json
-*token*
-*apikey*
-*api_key*
-
-# Archives / dropped bundles
-*.zip
-files*.zip
-files*/
-
-# Swarm runtime artifacts (usually not source)
-metrics/
-sessions/
-workspaces/
+*.key
+*.pem

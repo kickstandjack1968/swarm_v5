@@ -172,14 +172,19 @@ def configure_custom_workflow(coordinator: SwarmCoordinator) -> str:
 def handle_import_workflow(coordinator: SwarmCoordinator) -> str:
     """Handle the import workflow - import existing project and set up tasks."""
     try:
-        from project_import import import_existing_project, create_import_workflow, get_import_prompt
+        from project_import import (
+            import_existing_project, 
+            create_import_workflow, 
+            get_import_prompt_interactive,
+            setup_import_project_directory
+        )
     except ImportError as e:
         print(f"\n❌ Import workflow not available: {e}")
         print("   Ensure project_import.py and related modules are in the src/ directory")
         return ""
     
     # Get project path and task description from user
-    project_path, task_description = get_import_prompt()
+    project_path, task_description = get_import_prompt_interactive()
     
     if not task_description.strip():
         print("\n❌ No task description provided. Exiting.")
@@ -189,12 +194,16 @@ def handle_import_workflow(coordinator: SwarmCoordinator) -> str:
         # Import the project
         imported_project = import_existing_project(project_path)
         
+        # --- NEW CODE: Actually copy the files ---
+        print(f"\n📁 Setting up project directory...")
+        setup_import_project_directory(coordinator, project_path, task_description)
+
         # Create workflow tasks
         create_import_workflow(coordinator, imported_project, task_description)
         
         # Store workspace info for later
         coordinator.state["project_info"]["source_project"] = project_path
-        coordinator.state["project_info"]["workspace_dir"] = str(imported_project.workspace_dir)
+        coordinator.state["project_info"]["workspace_dir"] = imported_project.get("path", project_path)
         
         return task_description
         

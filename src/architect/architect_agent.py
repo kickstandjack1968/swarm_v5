@@ -93,24 +93,46 @@ RULES:
 3. Do NOT include any file named "{FORBIDDEN_FILENAME}" in the plan.
 
 REQUIRED YAML SCHEMA:
-program: <string description of the program>
-architecture: <string description of the architectural approach>
+```yaml
+program:
+  name: "project_name"
+  description: "What the program does"
+  type: "cli|subprocess_tool|library|service"
+architecture:
+  pattern: "simple|layered|modular"
+  entry_point: "filename.py or null for libraries"
+
 files:
-  - name: <relative path/filename>
-    purpose: <string description of what this file does>
-    dependencies:
-      - <filename that this file imports or depends on>
+  - name: "config.py"
+    purpose: "What this file does"
+    dependencies: []
+    exports:
+      - name: "Settings"
+        type: "class"
     requirements:
-      - <specific requirement string>
-execution_order:
-  - <filename 1>
-  - <filename 2>
+      - "Specific requirement 1"
+  
+  - name: "main.py"
+    purpose: "Entry point"
+    dependencies: ["config.py"]
+    imports_from:
+      config.py: ["Settings"]
+    exports: []
+    requirements:
+      - "Run the application"
+
+execution_order: ["config.py", "main.py"]
+```
 
 CONSTRAINTS:
-- 'files' must be a non-empty list.
+- 'program' must be a dict with 'name', 'description', and 'type' keys.
+- 'architecture' must be a dict with 'pattern' and 'entry_point' keys.
+- 'files' must be a non-empty list of file specifications.
+- Each file must have 'name', 'purpose', and 'requirements' (list).
+- 'dependencies', 'exports', 'imports_from' are optional but recommended.
 - 'execution_order' must be a non-empty list of filenames.
 - Every filename in 'execution_order' MUST exist in the 'files' list.
-- Every dependency listed in 'dependencies' MUST exist in the 'files' list.
+- Every dependency listed must exist in the 'files' list.
 """
 
 def generate_user_prompt(request, clarification):
@@ -196,38 +218,149 @@ def call_llm(model_cfg, system_prompt, user_prompt):
 
 def extract_yaml(text):
     """Extracts YAML block from text."""
-    # 1. Try markdown block
-    match = re.search(r"```yaml\s*(.*?)\s*```", text, re.DOTALL)
+    # 1. Try markdown block (yaml or yml)
+    match = re.search(r"```ya?ml\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
     if match:
         return match.group(1).strip()
     
-    # 2. Try finding raw YAML start
-    # Look for "program:" at start of a line
-    match = re.search(r"(^|\n)program:.*", text, re.DOTALL)
+    # 2. Try finding raw YAML start with "program:" (nested structure)
+    match = re.search(r"(^|\n)(program:\s*\n\s+name:.*)", text, re.DOTALL)
     if match:
-        return match.group(0).strip()
+        return match.group(2).strip()
+    
+    # 3. Fallback: look for "program:" at start of a line (flat structure - legacy)
+    match = re.search(r"(^|\n)(program:.*)", text, re.DOTALL)
+    if match:
+        return match.group(2).strip()
     
     return None
 
+def normalize_filename(name: str) -> str:
+    """
+    Normalize a filename to a canonical form for comparison.
+    Handles various formats LLMs might output:
+    - parsers.base_parser.py -> parsers/base_parser.py
+    - parsers/base_parser -> parsers/base_parser.py
+    - ./parsers/base_parser.py -> parsers/base_parser.py
+    """
+    # Replace dots with slashes (but not the file extension dot)
+    # e.g., "parsers.base_parser.py" -> "parsers/base_parser.py"
+    if name.count('.') > 1:  # Has dots beyond just extension
+        parts = name.rsplit('.', 1)  # Split off extension
+        if len(parts) == 2 and parts[1] in ('py', 'json', 'yaml', 'yml', 'txt', 'md'):
+            base = parts[0].replace('.', '/')
+            name = f"{base}.{parts[1]}"
+    
+    # Remove leading ./
+    if name.startswith('./'):
+        name = name[2:]
+    
+    # Ensure .py extension for Python files without extension
+    if '/' in name and not name.endswith(('.py', '.json', '.yaml', '.yml', '.txt', '.md', '.toml')):
+        # Check if it looks like a Python module path
+        if not any(name.endswith(ext) for ext in ['.py', '.json', '.yaml', '.yml', '.txt', '.md', '.toml']):
+            name = name + '.py'
+    
+    return name
+
+
+def build_filename_lookup(files: list) -> dict:
+    """
+    Build a lookup dict that maps various filename formats to the canonical name.
+    This allows flexible matching when LLM uses different formats.
+    """
+    lookup = {}
+    for f in files:
+        canonical = f["name"]
+        normalized = normalize_filename(canonical)
+        
+        # Add the canonical name
+        lookup[canonical] = canonical
+        lookup[normalized] = canonical
+        
+        # Add dotted version (parsers/base.py -> parsers.base.py)
+        dotted = canonical.replace('/', '.')
+        lookup[dotted] = canonical
+        
+        # Add without extension
+        if canonical.endswith('.py'):
+            no_ext = canonical[:-3]
+            lookup[no_ext] = canonical
+            lookup[no_ext.replace('/', '.')] = canonical
+        
+        # Add with ./ prefix
+        lookup['./' + canonical] = canonical
+        
+    return lookup
+
+
 def validate_plan_schema(plan):
-    """Validates the parsed YAML object against the PlanExecutor schema."""
+    """
+    Validates the parsed YAML object against the PlanExecutor schema.
+    
+    This schema matches what plan_executor.py expects:
+    - program: dict with name, description, type
+    - architecture: dict with pattern, entry_point
+    - files: list of file specs
+    - execution_order: list of filenames
+    """
     if not isinstance(plan, dict):
         raise ValueError("Root YAML must be a dictionary.")
 
+    # =========================================================================
+    # VALIDATE TOP-LEVEL KEYS
+    # =========================================================================
     required_keys = ["program", "architecture", "files", "execution_order"]
     for k in required_keys:
         if k not in plan:
             raise ValueError(f"Missing top-level key: {k}")
 
+    # =========================================================================
+    # VALIDATE 'program' SECTION
+    # =========================================================================
+    program = plan["program"]
+    if isinstance(program, str):
+        # Legacy flat format - convert to dict for compatibility
+        plan["program"] = {
+            "name": program,
+            "description": program,
+            "type": "cli"
+        }
+    elif isinstance(program, dict):
+        # Modern nested format - validate required fields
+        if "name" not in program:
+            raise ValueError("'program' dict missing 'name' field.")
+        # Optional fields with defaults
+        program.setdefault("description", program["name"])
+        program.setdefault("type", "cli")
+    else:
+        raise ValueError("'program' must be a string or dict.")
+
+    # =========================================================================
+    # VALIDATE 'architecture' SECTION
+    # =========================================================================
+    architecture = plan["architecture"]
+    if isinstance(architecture, str):
+        # Legacy flat format - convert to dict for compatibility
+        plan["architecture"] = {
+            "pattern": architecture,
+            "entry_point": "main.py"
+        }
+    elif isinstance(architecture, dict):
+        # Modern nested format - validate/default fields
+        architecture.setdefault("pattern", "modular")
+        architecture.setdefault("entry_point", "main.py")
+    else:
+        raise ValueError("'architecture' must be a string or dict.")
+
+    # =========================================================================
+    # VALIDATE 'files' SECTION
+    # =========================================================================
     if not isinstance(plan["files"], list) or not plan["files"]:
         raise ValueError("'files' must be a non-empty list.")
     
-    if not isinstance(plan["execution_order"], list) or not plan["execution_order"]:
-        raise ValueError("'execution_order' must be a non-empty list.")
-
     known_files = set()
     
-    # Validate files
     for idx, f in enumerate(plan["files"]):
         if not isinstance(f, dict):
             raise ValueError(f"Item {idx} in 'files' is not a dictionary.")
@@ -236,26 +369,75 @@ def validate_plan_schema(plan):
         if "purpose" not in f:
             raise ValueError(f"File '{f['name']}' missing 'purpose'.")
         
-        # normalize dependencies/requirements to lists if missing
+        # Normalize optional fields to expected types
         if "dependencies" not in f:
             f["dependencies"] = []
         if "requirements" not in f:
             f["requirements"] = []
+        if "exports" not in f:
+            f["exports"] = []
+        if "imports_from" not in f:
+            f["imports_from"] = {}
             
         if not isinstance(f["dependencies"], list):
             raise ValueError(f"File '{f['name']}' dependencies must be a list.")
+        if not isinstance(f["requirements"], list):
+            raise ValueError(f"File '{f['name']}' requirements must be a list.")
+        if not isinstance(f["exports"], list):
+            raise ValueError(f"File '{f['name']}' exports must be a list.")
+        if not isinstance(f["imports_from"], dict):
+            raise ValueError(f"File '{f['name']}' imports_from must be a dict.")
         
         known_files.add(f["name"])
 
-    # Validate referential integrity
-    for f in plan["files"]:
-        for dep in f["dependencies"]:
-            if dep not in known_files:
-                raise ValueError(f"File '{f['name']}' depends on unknown file '{dep}'.")
+    # =========================================================================
+    # VALIDATE 'execution_order' SECTION
+    # =========================================================================
+    if not isinstance(plan["execution_order"], list) or not plan["execution_order"]:
+        raise ValueError("'execution_order' must be a non-empty list.")
+
+    # =========================================================================
+    # BUILD FILENAME LOOKUP FOR FLEXIBLE MATCHING
+    # =========================================================================
+    filename_lookup = build_filename_lookup(plan["files"])
     
+    # =========================================================================
+    # NORMALIZE AND VALIDATE REFERENTIAL INTEGRITY
+    # =========================================================================
+    # Check and normalize dependencies
+    for f in plan["files"]:
+        normalized_deps = []
+        for dep in f["dependencies"]:
+            if dep in filename_lookup:
+                normalized_deps.append(filename_lookup[dep])
+            elif normalize_filename(dep) in filename_lookup:
+                normalized_deps.append(filename_lookup[normalize_filename(dep)])
+            else:
+                raise ValueError(f"File '{f['name']}' depends on unknown file '{dep}'.")
+        f["dependencies"] = normalized_deps
+        
+        # Check and normalize imports_from
+        normalized_imports = {}
+        for import_file, imports in f["imports_from"].items():
+            if import_file in filename_lookup:
+                canonical = filename_lookup[import_file]
+            elif normalize_filename(import_file) in filename_lookup:
+                canonical = filename_lookup[normalize_filename(import_file)]
+            else:
+                raise ValueError(f"File '{f['name']}' imports from unknown file '{import_file}'.")
+            normalized_imports[canonical] = imports
+        f["imports_from"] = normalized_imports
+    
+    # Normalize and check execution_order
+    normalized_order = []
     for item in plan["execution_order"]:
-        if item not in known_files:
+        if item in filename_lookup:
+            normalized_order.append(filename_lookup[item])
+        elif normalize_filename(item) in filename_lookup:
+            normalized_order.append(filename_lookup[normalize_filename(item)])
+        else:
             raise ValueError(f"execution_order contains unknown file '{item}'.")
+    plan["execution_order"] = normalized_order
 
 def main():
     # 1. Read STDIN
@@ -296,7 +478,7 @@ def main():
     model_config.setdefault("api_type", "openai")
     model_config.setdefault("timeout", 600)
     model_config.setdefault("temperature", 0.6)
-    model_config.setdefault("max_tokens", 4000)
+    model_config.setdefault("max_tokens", 25000)
     model_config.setdefault("top_p", 0.9)
 
     validate_model_config(model_config)
@@ -335,8 +517,14 @@ def main():
     except ValueError as e:
         fail(ERR_YAML_PARSE, f"Schema validation failed: {e}", {"extracted_yaml": yaml_str})
 
-    # 9. Success
-    success(raw_response, yaml_str)
+    # 9. Re-serialize to ensure normalized format
+    try:
+        normalized_yaml = yaml.dump(plan, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    except Exception:
+        normalized_yaml = yaml_str  # Fallback to original if dump fails
+
+    # 10. Success
+    success(raw_response, normalized_yaml)
 
 if __name__ == "__main__":
     main()
