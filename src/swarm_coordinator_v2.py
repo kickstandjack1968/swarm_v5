@@ -37,7 +37,7 @@ import sys
 
 # Plan Executor integration
 try:
-    from plan_executor import (
+    from plan_executor_v2 import (
         PlanExecutor, 
         create_planned_workflow,
         execute_plan_task,
@@ -59,7 +59,7 @@ class DockerSandbox:
     
     CONTAINER_NAME = "swarm_sandbox"
     IMAGE = "python:3.12-slim"
-    BASE_PACKAGES = ["pytest", "pyyaml", "requests"]
+    BASE_PACKAGES = ["pytest", "pyyaml", "requests", "chardet", "python-dateutil"]
     
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
@@ -356,6 +356,15 @@ _docker_sandbox: Optional[DockerSandbox] = None
 def get_docker_sandbox() -> Optional[DockerSandbox]:
     """Get the global Docker sandbox instance"""
     global _docker_sandbox
+    # Lazily ensure the sandbox is started when requested by other modules.
+    if _docker_sandbox:
+        try:
+            # If sandbox is enabled but not yet running, attempt to start it.
+            if getattr(_docker_sandbox, 'enabled', False) and not getattr(_docker_sandbox, 'container_running', False):
+                _docker_sandbox.start()
+        except Exception:
+            # Do not raise here; callers will fall back to local execution if needed.
+            pass
     return _docker_sandbox
 
 
@@ -699,7 +708,7 @@ class SwarmCoordinator:
             "model_config": {
                 "mode": "single",
                 "single_model": {
-                    "url": "http://localhost:1234/v1",
+                    "url": "http://localhost:1233/v1",
                     "model": "local-model",
                     "api_type": "openai",
                     "timeout": 7200
@@ -708,7 +717,7 @@ class SwarmCoordinator:
             "agent_parameters": {
                 "architect": {"temperature": 0.6, "max_tokens": 3000},
                 "clarifier": {"temperature": 0.7, "max_tokens": 2000},
-                "coder": {"temperature": 0.5, "max_tokens": 6000},
+                "coder": {"temperature": 0.2, "max_tokens": 6000},
                 "reviewer": {"temperature": 0.8, "max_tokens": 3000},
                 "tester": {"temperature": 0.7, "max_tokens": 4000},
                 "optimizer": {"temperature": 0.6, "max_tokens": 4000},
@@ -723,7 +732,62 @@ class SwarmCoordinator:
                 "enable_parallel": True
             }
         }
-    
+
+    def _generate_init_files(self, project_dir: str):
+        """Auto-generate __init__.py for all folders with Python files."""
+        import os
+        
+        src_dir = os.path.join(project_dir, "src")
+        if not os.path.exists(src_dir):
+            return
+        
+        # Find all folders containing .py files
+        folders_with_py = set()
+        for root, dirs, files in os.walk(src_dir):
+            if any(f.endswith('.py') for f in files):
+                folders_with_py.add(root)
+                # Also add parent folders
+                parent = root
+                while parent != src_dir:
+                    parent = os.path.dirname(parent)
+                    if parent:
+                        folders_with_py.add(parent)
+        
+        # Generate __init__.py for each
+        for folder in folders_with_py:
+            init_path = os.path.join(folder, "__init__.py")
+            if not os.path.exists(init_path):
+                # Simple __init__.py with exports
+                py_files = [f for f in os.listdir(folder) 
+                           if f.endswith('.py') and f != '__init__.py']
+                
+                lines = ['"""Auto-generated __init__.py"""', '']
+                
+                # Import from each module
+                for py_file in py_files:
+                    module = py_file[:-3]  # Remove .py
+                    lines.append(f"from .{module} import *")
+                
+                with open(init_path, 'w') as f:
+                    f.write('\n'.join(lines))
+                
+                print(f"   ✓ Generated: {os.path.relpath(init_path, project_dir)}")
+
+
+    def _enhance_coder_payload(self, payload, task):
+        """Enhance coder payload with plan context."""
+        # Get plan exports for context
+        plan_exports = self.state["context"].get("plan_exports", {})
+        if plan_exports:
+            # Add expected exports to user message
+            user_msg = payload.get("user_message", "")
+            exports_section = "\n\nPLAN-MANDATED EXPORTS:\n"
+            for filename, exports in plan_exports.items():
+                if exports:
+                    exports_section += f"  {filename}: {', '.join(exports)}\n"
+            payload["user_message"] = user_msg + exports_section
+        return payload
+
     def _ensure_projects_dir(self):
         """Ensure projects directory exists"""
         if not os.path.exists(self.projects_root):
@@ -899,7 +963,7 @@ PROJECT STRUCTURE
             return
         
         # Save code - handle multi-file output
-        code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution", "revision")), None)
+        code_task = next((t for t in reversed(self.completed_tasks) if t.task_type in ("coding", "plan_execution", "revision")), None)
         if code_task and code_task.result:
             files_dict = self._parse_multi_file_output(code_task.result)
             
@@ -943,7 +1007,8 @@ PROJECT STRUCTURE
                 
                 with open(code_file, 'w', encoding='utf-8') as f:
                     f.write(code_task.result)
-        
+        self._generate_init_files(project_dir)
+
 
         # Save tests (from Tester agent specifically)
         test_task = next((t for t in self.completed_tasks if t.task_type == "test_generation"), None)
@@ -1083,25 +1148,29 @@ PROJECT STRUCTURE
             return f"ENTRYPOINT CHECK: SKIP\n- Exception during checks: {e}"
     
     def _parse_multi_file_output(self, code_output: str) -> Dict[str, str]:
-        """
-        Parse coder output that contains multiple files.
-        Returns dict of {filename: content} or empty dict if single-file output.
-        
-        Expected format:
-        ### FILE: filename.py ###
-        <code content>
-        
-        ### FILE: another.py ###
-        <code content>
-        """
-        # Pattern to match file headers: ### FILE: name.py ###
+        """Parse coder output that contains multiple files."""
+    
+        # Pattern 1: ### FILE: filename.py ###
         file_pattern = r'###\s*FILE:\s*([^\s#]+)\s*###'
-        
         matches = list(re.finditer(file_pattern, code_output))
-        
+    
+        # Pattern 2: #### File: `filename.py` ... ```python ... ```
+        # More robust version handles case variations and optional language markers
+        if not matches:
+            md_pattern = r'#{1,4}\s*[Ff]ile:\s*`([^`]+)`.*?\n\s*```(?:python|py)?\s*\n(.*?)```'
+            md_matches = list(re.finditer(md_pattern, code_output, re.DOTALL))
+            if md_matches:
+                files = {}
+                for match in md_matches:
+                    filename = match.group(1).strip()
+                    content = match.group(2).strip()
+                    if content:
+                        files[filename] = content
+                return files
+    
         if not matches:
             return {}  # Single file output
-        
+    
         files = {}
         for i, match in enumerate(matches):
             filename = match.group(1).strip()
@@ -1217,35 +1286,53 @@ PROJECT STRUCTURE
         
         return '\n'.join(cleaned).strip()
     
-    def _verify_coder_files(self, architect_result: str, coder_result: str) -> tuple[bool, List[str]]:
+    def _verify_coder_files_v2(self, architect_result: str, coder_result: str) -> tuple:
         """
-        Verify that coder created all files specified by architect.
-        Returns (passed, list_of_missing_files)
+        Verify that coder created all files with correct exports.
+        Returns (passed, list_of_issues)
         """
-        # Extract expected files from architect output
-        expected_files = self._extract_expected_files(architect_result)
+        import yaml
         
-        if not expected_files:
-            return True, []  # No specific files required
+        issues = []
         
-        # Extract actual files from coder output
-        actual_files = set(self._parse_multi_file_output(coder_result).keys())
+        # Parse architect's plan
+        try:
+            plan = yaml.safe_load(architect_result)
+            if not plan or 'files' not in plan:
+                return True, []  # Can't verify without plan
+        except:
+            return True, []
         
-        # If coder produced single file, try to infer from content
+        # Parse coder's output
+        actual_files = self._parse_multi_file_output(coder_result)
+        
         if not actual_files:
-            # Check if it's just a single-file project
-            if len(expected_files) <= 1:
-                return True, []
-            # Multiple files expected but got single output
-            return False, list(expected_files)
+            # Single file output - can't verify multi-file plan
+            if len(plan.get('files', [])) > 1:
+                return False, ["Expected multiple files but got single output"]
+            return True, []
         
-        # Compare
-        missing = expected_files - actual_files
+        # Check each planned file
+        for file_spec in plan.get('files', []):
+            filename = file_spec.get('name', '')
+            planned_exports = [e.get('name') for e in file_spec.get('exports', [])]
+            
+            # Check file exists
+            if filename not in actual_files:
+                issues.append(f"Missing file: {filename}")
+                continue
+            
+            # Check exports exist
+            if planned_exports:
+                content = actual_files[filename]
+                actual_exports = set(self._extract_exports_from_code(content))
+                
+                for export in planned_exports:
+                    if export not in actual_exports:
+                        issues.append(f"{filename}: Missing export '{export}'")
         
-        if missing:
-            return False, list(missing)
-        
-        return True, []
+        return len(issues) == 0, issues
+
     
     def _extract_expected_files(self, architect_result: str) -> set:
         """Extract expected file names from architect's design"""
@@ -1457,24 +1544,83 @@ PROJECT STRUCTURE
             raise Exception(f"Invalid JSON from agent {role_name}: {result.stdout}")
 
 
-    # Smoke Add
     def _run_smoke_tests(self) -> Dict:
-        """Run smoke tests for verification with explicit PYTHONPATH."""
+        """Run smoke tests (Pytest + CLI) in Docker if available, otherwise Local."""
         project_dir = self.state["project_info"].get("project_dir")
         if not project_dir: return {}
 
-        # 1. Setup Environment
-        # Critical Fix: Add both 'project_root' and 'src' to PYTHONPATH
-        # This fixes the "ModuleNotFoundError: No module named 'api'" errors
+        results = {}
+
+        # ---------------------------------------------------------------------
+        # PATH A: DOCKER EXECUTION (If Sandbox is ready)
+        # ---------------------------------------------------------------------
+        if self.sandbox and self.sandbox.enabled and self.sandbox.container_running:
+            print("   🐳 Running verification in Docker sandbox...")
+            
+            # 1. Sync files to container
+            # We copy the whole project dir to /workspace
+            # Note: simplistic copy; for huge projects rsync is better, but this works for agents.
+            src_local = os.path.join(project_dir, "src")
+            tests_local = os.path.join(project_dir, "tests")
+            
+            # Create remote dirs
+            self.sandbox._exec(["mkdir", "-p", "/workspace/src", "/workspace/tests"])
+            
+            # Copy src files
+            if os.path.exists(src_local):
+                for f in os.listdir(src_local):
+                    if f.endswith(".py"):
+                        self.sandbox.copy_to_container(os.path.join(src_local, f), f"/workspace/src/{f}")
+            
+            # Copy test files
+            if os.path.exists(tests_local):
+                for f in os.listdir(tests_local):
+                    if f.endswith(".py"):
+                        self.sandbox.copy_to_container(os.path.join(tests_local, f), f"/workspace/tests/{f}")
+
+            # 2. Run Pytest in Docker
+            # We use the sandbox's internal run_pytest or raw _exec
+            code, output = self.sandbox.run_pytest("/workspace/tests")
+            # Parse the output into a result dict format similar to local
+            results["pytest"] = {
+                "returncode": 0 if code else 1,
+                "stdout": output,
+                "stderr": "", 
+                "cmd": "pytest (docker)"
+            }
+
+            # 3. Run CLI Help in Docker
+            entry_point = self.state.get("project_info", {}).get("entry_point", "src/main.py")
+            # Convert src/main.py -> src.main
+            module_path = entry_point.replace("/", ".").replace("\\", ".").rstrip(".py")
+            if module_path.endswith("."): module_path = module_path[:-1]
+            if not module_path.startswith("src."): module_path = f"src.{module_path}"
+
+            cli_res = self.sandbox._exec(
+                ["python", "-m", module_path, "--help"],
+                timeout=10
+            )
+            results["cli_help"] = {
+                "returncode": cli_res.returncode,
+                "stdout": cli_res.stdout,
+                "stderr": cli_res.stderr,
+                "cmd": f"python -m {module_path} --help (docker)"
+            }
+
+            return results
+
+        # ---------------------------------------------------------------------
+        # PATH B: LOCAL FALLBACK (Original Logic)
+        # ---------------------------------------------------------------------
+        print("   ⚠ Docker unavailable/disabled. Running verification locally.")
+        
+        # Setup Environment
         env = os.environ.copy()
         src_dir = os.path.join(project_dir, "src")
         env["PYTHONPATH"] = f"{project_dir}{os.pathsep}{src_dir}{os.pathsep}{env.get('PYTHONPATH','')}"
         
-        results = {}
-        
-        # 2. Run Pytest (Logic Check)
+        # Run Pytest
         try:
-            # We run pytest as a module (-m pytest) to ensure sys.path is handled correctly
             res = subprocess.run(
                 [sys.executable, "-m", "pytest", "-q"],
                 cwd=project_dir, env=env, capture_output=True, text=True, timeout=30
@@ -1488,22 +1634,28 @@ PROJECT STRUCTURE
         except Exception as e:
             results["pytest"] = {"returncode": -1, "stderr": str(e), "cmd": "pytest -q"}
 
-        # 3. Run CLI Help (Entry Point Check)
+        # Run CLI Help
         try:
-            # We check if the app can actually start up and show help
-            # This catches immediate crashes in main.py or config.py
+            entry_point = self.state.get("project_info", {}).get("entry_point", "src/main.py")
+            module_path = entry_point.replace("/", ".").replace("\\", ".").rstrip(".py")
+            if module_path.endswith("."): module_path = module_path[:-1]
+            
+            # Patch 3 Logic: Ensure src. prefix
+            if os.path.exists(os.path.join(project_dir, "src")) and not module_path.startswith("src."):
+                 module_path = f"src.{module_path}"
+            
             res = subprocess.run(
-                [sys.executable, "-m", "src.main", "--help"],
+                [sys.executable, "-m", module_path, "--help"],
                 cwd=project_dir, env=env, capture_output=True, text=True, timeout=10
             )
             results["cli_help"] = {
                 "returncode": res.returncode, 
                 "stdout": res.stdout, 
                 "stderr": res.stderr, 
-                "cmd": "python -m src.main --help"
+                "cmd": f"python -m {module_path} --help"
             }
         except Exception as e:
-            results["cli_help"] = {"returncode": -1, "stderr": str(e), "cmd": "python -m src.main --help"}
+            results["cli_help"] = {"returncode": -1, "stderr": str(e), "cmd": "cli_help check"}
             
         return results
     # -------------------------------------------------------------------------
@@ -1644,7 +1796,7 @@ Be specific and reference actual code from the project."""
                     "system_prompt": system_prompt,
                     "user_message": user_message,
                     "config": {
-                        "model_url": ver_config.get("url", "http://localhost:1234/v1"),
+                        "model_url": ver_config.get("url", "http://localhost:1233/v1"),
                         "model_name": ver_config.get("model", "local-model"),
                         "api_type": ver_config.get("api_type", "openai"),
                         "temperature": 0.3,
@@ -1704,7 +1856,7 @@ Be specific and reference actual code from the project."""
                 payload = {
                     "user_request": task.metadata.get("user_request", ""),
                     "config": {
-                        "model_url": clarifier_config.get("url", "http://localhost:1234/v1"),
+                        "model_url": clarifier_config.get("url", "http://localhost:1233/v1"),
                         "model_name": clarifier_config.get("model", "local-model"),
                         "api_type": clarifier_config.get("api_type", "openai"),
                         "temperature": 0.7,
@@ -1732,61 +1884,44 @@ Be specific and reference actual code from the project."""
                 task.completed_at = time.time()
                 return task
 
-            # --- 3. ARCHITECT TASK (External: Architect) ---
-            # Handles both standard "architecture" and planned "architecture_plan"
+            # --- 3. ARCHITECT TASK ---
             if task.assigned_role == AgentRole.ARCHITECT:
-                # Prepare Prompts
                 if task.task_type == "architecture_plan":
-                    system_prompt = ARCHITECT_PLAN_SYSTEM_PROMPT
-                    user_message = get_architect_plan_prompt(
-                        task.metadata.get('user_request', ''), 
-                        self.state["context"].get('clarification', '')
+                    if not PLAN_EXECUTOR_AVAILABLE:
+                        raise Exception("Plan executor not available - ensure plan_executor.py is in the same directory")
+                system_prompt = ARCHITECT_PLAN_SYSTEM_PROMPT
+                user_message = get_architect_plan_prompt(
+                    task.metadata.get('user_request', ''), 
+                    self.state["context"].get('clarification', '')
                     )
-                else:
-                    system_prompt = self._get_system_prompt(AgentRole.ARCHITECT, task.task_type, task.metadata)
-                    user_message = self._build_user_message(task)
-
                 architect_config = self.executor._get_agent_config(AgentRole.ARCHITECT)
-                
                 payload = {
-                    "system_prompt": system_prompt,
-                    "user_message": user_message,
-                    "config": {
-                        "model_url": architect_config.get("url", "http://localhost:1234/v1"),
-                        "model_name": architect_config.get("model", "local-model"),
-                        "api_type": architect_config.get("api_type", "openai"),
-                        "temperature": 0.6,
-                        "max_tokens": 3000,
-                        "timeout": architect_config.get("timeout", 600)
+                        "system_prompt": system_prompt,
+                        "user_message": user_message,
+                        "config": {
+                            "model_url": architect_config.get("url", "http://localhost:1233/v1"),
+                            "model_name": architect_config.get("model", "local-model"),
+                            "api_type": architect_config.get("api_type", "openai"),
+                            "temperature": 0.6,
+                            "max_tokens": 3000,
+                            "timeout": architect_config.get("timeout", 600)
+                        }
                     }
-                }
 
-                try:
-                    # Generic Call
-                    output = self._run_external_agent("architect", payload)
-                    
-                    if output.get("status") == "error":
-                        raise Exception(output.get("error"))
-                    
-                    result_text = output.get("result", "")
-                    task.result = result_text
-                    
-                    # Special handling for YAML plans
-                    if task.task_type == "architecture_plan":
-                        plan_yaml = extract_yaml_from_response(result_text)
-                        self.state["context"]["plan_yaml"] = plan_yaml
-                        task.result = plan_yaml # Store clean YAML
-                        self._set_project_type_from_plan(plan_yaml)
-                        print("\n" + "="*60)
-                        print("YAML EXECUTION PLAN (External)")
-                        print("="*60)
-                        print(plan_yaml)
-                        print("="*60)
-
-                    task.status = TaskStatus.COMPLETED
-                except Exception as e:
-                    task.status = TaskStatus.FAILED
-                    task.error = str(e)
+                output = self._run_external_agent("architect", payload)
+                if output.get("status") == "error":
+                    raise Exception(output.get("error"))
+                result_text = output.get("result", "")
+                plan_yaml = extract_yaml_from_response(result_text)
+                self.state["context"]["plan_yaml"] = plan_yaml
+                task.result = plan_yaml
+                self._set_project_type_from_plan(plan_yaml)
+                task.status = TaskStatus.COMPLETED
+            else:
+                system_prompt = self._get_system_prompt(AgentRole.ARCHITECT, task.task_type, task.metadata)
+                user_message = self._build_user_message(task)
+                task.result = self.executor.execute_agent(AgentRole.ARCHITECT, system_prompt, user_message)
+                task.status = TaskStatus.COMPLETED
                 
                 task.completed_at = time.time()
                 self._update_context(task)
@@ -1806,7 +1941,7 @@ Be specific and reference actual code from the project."""
                     "system_prompt": system_prompt,
                     "user_message": user_message,
                     "config": {
-                        "model_url": coder_config.get("url", "http://localhost:1234/v1"),
+                        "model_url": coder_config.get("url", "http://localhost:1233/v1"),
                         "model_name": coder_config.get("model", "local-model"),
                         "api_type": coder_config.get("api_type", "openai"),
                         "temperature": 0.5,
@@ -1814,6 +1949,8 @@ Be specific and reference actual code from the project."""
                         "timeout": coder_config.get("timeout", 1200)
                     }
                 }
+
+                payload = self._enhance_coder_payload(payload, task)
 
                 try:
                     # Generic Call
@@ -1874,7 +2011,7 @@ Be specific and reference actual code from the project."""
                     "system_prompt": system_prompt,
                     "user_message": user_message,
                     "config": {
-                        "model_url": reviewer_config.get("url", "http://localhost:1234/v1"),
+                        "model_url": reviewer_config.get("url", "http://localhost:1233/v1"),
                         "model_name": reviewer_config.get("model", "local-model"),
                         "api_type": reviewer_config.get("api_type", "openai"),
                         "temperature": 0.8,
@@ -1921,7 +2058,7 @@ Be specific and reference actual code from the project."""
                     "system_prompt": system_prompt,
                     "user_message": user_message,
                     "config": {
-                        "model_url": tester_config.get("url", "http://localhost:1234/v1"),
+                        "model_url": tester_config.get("url", "http://localhost:1233/v1"),
                         "model_name": tester_config.get("model", "local-model"),
                         "api_type": tester_config.get("api_type", "openai"),
                         "temperature": 0.7,
@@ -1956,7 +2093,7 @@ Be specific and reference actual code from the project."""
                     "system_prompt": system_prompt,
                     "user_message": user_message,
                     "config": {
-                        "model_url": doc_config.get("url", "http://localhost:1234/v1"),
+                        "model_url": doc_config.get("url", "http://localhost:1233/v1"),
                         "model_name": doc_config.get("model", "local-model"),
                         "api_type": doc_config.get("api_type", "openai"),
                         "temperature": 0.7,
@@ -1995,7 +2132,7 @@ Be specific and reference actual code from the project."""
                     "system_prompt": system_prompt,
                     "user_message": user_message,
                     "config": {
-                        "model_url": sec_config.get("url", "http://localhost:1234/v1"),
+                        "model_url": sec_config.get("url", "http://localhost:1233/v1"),
                         "model_name": sec_config.get("model", "local-model"),
                         "api_type": sec_config.get("api_type", "openai"),
                         "temperature": 0.8,
@@ -2029,7 +2166,7 @@ Be specific and reference actual code from the project."""
                     "system_prompt": system_prompt,
                     "user_message": user_message,
                     "config": {
-                        "model_url": opt_config.get("url", "http://localhost:1234/v1"),
+                        "model_url": opt_config.get("url", "http://localhost:1233/v1"),
                         "model_name": opt_config.get("model", "local-model"),
                         "api_type": opt_config.get("api_type", "openai"),
                         "temperature": 0.6,
@@ -2101,7 +2238,7 @@ Be specific and reference actual code from the project."""
                     "system_prompt": system_prompt,
                     "user_message": user_message,
                     "config": {
-                        "model_url": ver_config.get("url", "http://localhost:1234/v1"),
+                        "model_url": ver_config.get("url", "http://localhost:1233/v1"),
                         "model_name": ver_config.get("model", "local-model"),
                         "api_type": ver_config.get("api_type", "openai"),
                         "temperature": 0.3,
@@ -2245,25 +2382,58 @@ Be specific and reference actual code from the project."""
         return '\n'.join(fixed_lines)
     
     def _clean_test_output(self, test_code: str) -> str:
-        """Clean markdown formatting from test output"""
-        # Remove markdown code fences
-        test_code = re.sub(r'^```python\s*\n?', '', test_code)
-        test_code = re.sub(r'^```\s*\n?', '', test_code, flags=re.MULTILINE)
-        test_code = re.sub(r'\n```\s*$', '', test_code)
+        """Clean markdown formatting and prose from test output"""
+        # Strategy 1: If there's a code block, extract from it
+        code_block_match = re.search(r'```(?:python)?\s*\n(.*?)```', test_code, re.DOTALL)
+        if code_block_match:
+            test_code = code_block_match.group(1)
+        else:
+            # Remove stray backticks
+            test_code = re.sub(r'^```python\s*\n?', '', test_code)
+            test_code = re.sub(r'^```\s*\n?', '', test_code, flags=re.MULTILINE)
+            test_code = re.sub(r'\n```\s*$', '', test_code)
         
-        # Remove any leading/trailing whitespace
         test_code = test_code.strip()
         
-        # Ensure it starts with valid Python (import or comment)
+        # Strategy 2: Strip leading prose (anything before first valid Python line)
         lines = test_code.split('\n')
         start_idx = 0
         for i, line in enumerate(lines):
             stripped = line.strip()
-            if stripped.startswith(('import ', 'from ', '#', '"""', "'''")):
+            # Valid Python starts: imports, comments, docstrings, decorators, or code
+            if stripped.startswith(('import ', 'from ', '#', '"""', "'''", '@', 'def ', 'class ', 'async ')):
+                start_idx = i
+                break
+            # Also accept pytest fixtures and constants
+            if re.match(r'^[A-Z_][A-Z0-9_]*\s*=', stripped) or stripped.startswith('pytest'):
                 start_idx = i
                 break
         
-        return '\n'.join(lines[start_idx:])
+        # Strategy 3: Strip trailing prose (anything after code ends)
+        # Look for explanatory text patterns
+        end_idx = len(lines)
+        code_ended = False
+        for i in range(len(lines) - 1, start_idx, -1):
+            stripped = lines[i].strip()
+            # Skip empty lines at the end
+            if not stripped:
+                continue
+            # Prose indicators: sentences that explain rather than code
+            prose_patterns = [
+                r'^(This |These |The |Note:|Here |I |We |To |In this|This test)',
+                r'^(Make sure|Remember|You can|For example)',
+                r'^\d+\.\s+\w',  # Numbered lists
+                r'^\*\s+\w',     # Bullet points
+            ]
+            is_prose = any(re.match(p, stripped, re.IGNORECASE) for p in prose_patterns)
+            if is_prose and not code_ended:
+                end_idx = i
+            elif stripped and not is_prose:
+                code_ended = True
+                break
+        
+        cleaned_lines = lines[start_idx:end_idx if end_idx != len(lines) else None]
+        return '\n'.join(cleaned_lines).rstrip()
 
     def execute_tasks_parallel(self, tasks: List[Task]) -> List[Task]:
         """Execute multiple tasks in parallel"""
@@ -2293,7 +2463,7 @@ Be specific and reference actual code from the project."""
             return
         user_request = task.metadata.get("user_request", "")
         
-        result = task.result.strip()
+        result = (task.result).strip()
         
         # Check if requirements are already clear
         if "STATUS: CLEAR" in result.upper():
@@ -2346,7 +2516,7 @@ Be specific and reference actual code from the project."""
             "questions": result,
             "answers": answers_text,
             "config": {
-                "model_url": clarifier_config.get("url", "http://localhost:1234/v1"),
+                "model_url": clarifier_config.get("url", "http://localhost:1233/v1"),
                 "model_name": clarifier_config.get("model", "local-model"),
                 "api_type": clarifier_config.get("api_type", "openai"),
                 "temperature": 0.7,
@@ -2982,6 +3152,9 @@ CRITICAL OUTPUT RULES:
 2. NEVER copy source code into test files - always import from the source module
 3. The first line must be an import statement, not a markdown fence
 4. The output must be directly saveable as a .py file and runnable with pytest
+5. NO EMPTY FUNCTIONS. If you need a placeholder, you MUST use 'pass'.
+   WRONG: def test_foo():
+   RIGHT: def test_foo(): pass
 
 IMPORT RULES:
 - Import the functions you're testing from the ACTUAL source modules provided in context
@@ -2998,6 +3171,7 @@ STRUCTURE:
 - Start with imports: pytest, unittest.mock, then the source modules
 - Use pytest fixtures for common setup (mock configs, temp files, temp databases)
 - Group related tests in classes if appropriate
+- Ensure every test function has a body (assertions or pass)
 
 TEST COVERAGE REQUIREMENTS:
 - Unit tests for each public function/method listed in the exports
@@ -3446,18 +3620,36 @@ OUTPUT YOUR COMPLETE REVISED CODE BELOW:
         
         return "\n".join(message_parts)
     
-    def _update_context(self, task: Task):
-        """Update shared context with task results"""
+    def _update_context(self, task):
+        """Update shared context with task results - ENHANCED VERSION."""
         context_key = f"{task.task_type}_{task.assigned_role.value}"
         self.state["context"][context_key] = {
             "task_id": task.task_id,
             "result": task.result,
             "completed_at": task.completed_at
         }
-        
-        # Also store latest code separately for easy access
-        if task.task_type in ("coding", "revision") and task.result:
+    
+        # Store latest code separately
+        if task.task_type in ("coding", "revision", "plan_execution") and task.result:
             self.state["context"]["latest_code"] = task.result
+    
+        # NEW: Store parsed plan for downstream access
+        if task.task_type == "architecture_plan" and task.result:
+            try:
+                import yaml
+                parsed = yaml.safe_load(task.result)
+                self.state["context"]["parsed_plan"] = parsed
+            
+                # Extract key info for quick access
+                self.state["context"]["plan_files"] = [
+                    f.get('name') for f in parsed.get('files', [])
+                ]
+                self.state["context"]["plan_exports"] = {
+                    f.get('name'): [e.get('name') for e in f.get('exports', [])]
+                    for f in parsed.get('files', [])
+                }
+            except:
+                pass
 
     def _get_verifier_prompt(self, task: Task) -> tuple[str, str]:
         """Generate prompt for verifier agent (includes smoke test results)."""

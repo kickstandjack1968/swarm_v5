@@ -21,7 +21,7 @@ def print_banner():
 ║                                                                              ║
 ║                   ADVANCED MULTI-AGENT SWARM v2.0 (FIXED)                    ║
 ║                                                                              ║
-║  Parallel Execution • Dynamic Routing • Enhanced Observability              ║
+║  Parallel Execution • Dynamic Routing • Enhanced Observability               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
     print(banner)

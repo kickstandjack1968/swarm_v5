@@ -9,84 +9,84 @@
     },
     "multi_model": {
       "architect": {
-        "url": "http://localhost:1233/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "Lm Studio qwen/qwen3-coder-30b (Architect)",
         "api_type": "openai",
         "timeout": 7200
       },
       "clarifier": {
-        "url": "http://localhost:1233/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "LM Studio qwen/qwen3-coder-30b (Clarifier)",
         "api_type": "openai",
         "timeout": 7200
       },
       "coder": {
-        "url": "http://localhost:1233/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "LM Studio qwen/qwen3-coder-30b (Coder)",
         "api_type": "openai",
         "timeout": 7200
       },
       "verifier": {
-        "url": "http://localhost:1233/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "LM Studio qwen/qwen3-coder-30b (Verifier)",
         "api_type": "openai",
         "timeout": 7200
       },
       "reviewer": {
-        "url": "http://localhost:1233/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "qwen/qwen3-coder-30b (Reviewer)",
         "api_type": "openai",
         "timeout": 7200
       },
       "tester": {
-        "url": "http://localhost:1233/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "qwen/qwen3-coder-30b (Tester)",
         "api_type": "openai",
         "timeout": 7200
       },
       "optimizer": {
-        "url": "http://localhost:1233/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "LM Studio qwen/qwen3-coder-30b (Optimizer)",
         "api_type": "openai",
         "timeout": 7200
       },
       "documenter": {
-        "url": "http://localhost:1233/v1",
-        "model": "qwen2.5-coder-7b-instruct",
-        "model_name": "qwen2.5-coder-7b-instruct (Documenter)",
+        "url": "http://localhost:1234/v1",
+        "model": "qwen/qwen3-coder-30b",
+        "model_name": "qwen/qwen3-coder-30b (Documenter)",
         "api_type": "openai",
         "timeout": 7200
       },
       "debugger": {
-        "url": "http://localhost:1233/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
-        "model_name": "qwen/qwen3-coder-30b(Debugger)",
+        "model_name": "qwen2.5-coder-32b-instruct(Debugger)",
         "api_type": "openai",
         "timeout": 7200
       },
       "security": {
-        "url": "http://localhost:1233/v1",
-        "model": "qwen2.5-coder-7b-instruct",
-        "model_name": "qwen2.5-coder-7b-instruct(Security)",
+        "url": "http://localhost:1234/v1",
+        "model": "qwen2.5-coder-32b-instruct",
+        "model_name": "qwen2.5-coder-32b-instruct(Security)",
         "api_type": "openai",
         "timeout": 7200
       },
       "fallback_coder": {
-          "url": "http://localhost:1233/v1",
-          "model": "qwen2.5-coder-7b-instruct",
-          "model_name": "qwen2.5-coder-7b-instruct(Security)",
+          "url": "http://localhost:1234/v1",
+          "model": "qwen2.5-coder-32b-instruct",
+          "model_name": "qwen2.5-coder-32b-instruct(Security)",
           "api_type": "openai",
           "timeout": 7200
         },
       "arbitrator": {
-        "url": "http://localhost:1233/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "qwen/qwen3-coder-30b (Arbitrator)",
         "api_type": "openai",
@@ -241,3 +241,4 @@
     "enable_checkpointing": true
   }
 }
+

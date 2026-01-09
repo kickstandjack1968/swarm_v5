@@ -32,7 +32,7 @@ except ImportError:
                 self.input_data = json.load(sys.stdin)
                 config = self.input_data.get("config", {})
                 self.config = type('Config', (), {
-                    'url': config.get("model_url", "http://localhost:1233/v1"),
+                    'url': config.get("model_url", "http://localhost:1234/v1"),
                     'model': config.get("model_name", "local-model"),
                     'api_type': config.get("api_type", "openai"),
                     'timeout': config.get("timeout", 1200),
