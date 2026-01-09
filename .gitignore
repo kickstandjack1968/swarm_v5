@@ -37,3 +37,6 @@ sessions/
 logs/
 metrics/
 *.db
+
+# generated outputs
+projects/
