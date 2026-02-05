@@ -69,9 +69,10 @@ def select_workflow() -> str:
     print("   5. PLANNED   - File-by-file execution with YAML plan")
     print("   6. IMPORT    - Import existing project and modify it")
     print("   7. BUGFIX    - Debug and fix bugs in existing code")
-    
+    print("   8. COLLABORATIVE - Clarify → Draft Plan → Coder Reviews → Final Plan → Build → Compliance Review")
+
     while True:
-        choice = input("\nYour choice [1-7]: ").strip()
+        choice = input("\nYour choice [1-8]: ").strip()
         if choice == '1':
             return 'standard'
         elif choice == '2':
@@ -86,8 +87,10 @@ def select_workflow() -> str:
             return 'import'
         elif choice == '7':
             return 'bugfix'
+        elif choice == '8':
+            return 'collaborative'
         else:
-            print("❌ Invalid choice. Please enter 1-7.")
+            print("❌ Invalid choice. Please enter 1-8.")
 
 
 def configure_custom_workflow(coordinator: SwarmCoordinator) -> str:

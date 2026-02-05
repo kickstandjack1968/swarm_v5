@@ -1491,6 +1491,39 @@ PROJECT STRUCTURE
     # -------------------------------------------------------------------------
     # NEW GENERIC RUNNER
     # -------------------------------------------------------------------------
+    def _log_prompt(self, step: str, agent_name: str, payload: Dict, mode: str = ""):
+        """Save full prompt payload to projects/<project>/prompt_logs/ as JSON."""
+        project_dir = self.state["project_info"].get("project_dir")
+        if not project_dir:
+            return
+
+        log_dir = os.path.join(project_dir, "prompt_logs")
+        os.makedirs(log_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%H%M%S")
+        filename = f"{timestamp}_{agent_name}_{step}.json"
+
+        log_entry = {
+            "step": step,
+            "agent": agent_name,
+            "timestamp": datetime.now().isoformat(),
+            "mode": mode,
+            "system_prompt": payload.get("system_prompt", ""),
+            "user_message": payload.get("user_message", ""),
+        }
+        # Include any extra keys from payload (job_spec, plan_yaml, etc.)
+        for key in ("job_spec", "plan_yaml", "code", "draft_plan", "coder_feedback"):
+            if key in payload:
+                log_entry[key] = payload[key]
+
+        log_path = os.path.join(log_dir, filename)
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                json.dump(log_entry, f, indent=2)
+            print(f"  [LOG] {filename}")
+        except Exception as e:
+            print(f"  [LOG] Warning: could not save prompt log: {e}")
+
     def _run_external_agent(self, role_name: str, payload: Dict) -> Dict:
         """
         Generic handler to run any external agent script.
@@ -1676,6 +1709,218 @@ PROJECT STRUCTURE
                 self._update_context(task)
                 return task
             
+            # --- COLLABORATIVE WORKFLOW TASK HANDLERS ---
+
+            # DRAFT_PLAN: Architect produces draft plan from job_spec
+            if task.task_type == "draft_plan":
+                job_spec = self.state["context"].get("job_spec", "")
+                if not job_spec:
+                    job_spec = self.state["context"].get("job_scope", "")
+                architect_config = self.executor._get_agent_config(AgentRole.ARCHITECT)
+
+                payload = {
+                    "mode": "draft",
+                    "job_spec": job_spec,
+                    "config": {
+                        "model_url": architect_config.get("url", "http://localhost:1233/v1"),
+                        "model_name": architect_config.get("model", "local-model"),
+                        "api_type": architect_config.get("api_type", "openai"),
+                        "temperature": 0.6,
+                        "max_tokens": 4000,
+                        "timeout": architect_config.get("timeout", 600)
+                    }
+                }
+
+                self._log_prompt("DRAFT", "ARCHITECT", {"system_prompt": "DRAFT_PLAN_PROMPT", "user_message": job_spec, "job_spec": job_spec}, mode="draft")
+
+                try:
+                    output = self._run_external_agent("architect", payload)
+                    if output.get("status") == "error":
+                        raise Exception(output.get("error"))
+
+                    plan_yaml = output.get("plan_yaml") or output.get("result", "")
+                    self.state["context"]["draft_plan"] = plan_yaml
+                    task.result = plan_yaml
+                    task.status = TaskStatus.COMPLETED
+                    print(f"  ✓ Draft plan produced ({len(plan_yaml)} chars)")
+                except Exception as e:
+                    task.status = TaskStatus.FAILED
+                    task.error = str(e)
+
+                task.completed_at = time.time()
+                self._update_context(task)
+                return task
+
+            # PLAN_REVIEW: Coder reviews draft plan (no code)
+            if task.task_type == "plan_review":
+                draft_plan = self.state["context"].get("draft_plan", "")
+                coder_config = self.executor._get_agent_config(AgentRole.CODER)
+
+                payload = {
+                    "mode": "plan_review",
+                    "plan_yaml": draft_plan,
+                    "config": {
+                        "model_url": coder_config.get("url", "http://localhost:1233/v1"),
+                        "model_name": coder_config.get("model", "local-model"),
+                        "api_type": coder_config.get("api_type", "openai"),
+                        "temperature": 0.3,
+                        "max_tokens": 4000,
+                        "timeout": coder_config.get("timeout", 1200)
+                    }
+                }
+
+                self._log_prompt("PLAN_REVIEW", "CODER", {"system_prompt": "PLAN_REVIEW_PROMPT", "user_message": draft_plan, "plan_yaml": draft_plan}, mode="plan_review")
+
+                try:
+                    output = self._run_external_agent("coder", payload)
+                    if output.get("status") == "error":
+                        raise Exception(output.get("error"))
+
+                    review_text = output.get("review") or output.get("result", "")
+                    self.state["context"]["plan_review"] = review_text
+                    task.result = review_text
+                    task.status = TaskStatus.COMPLETED
+                    print(f"  ✓ Plan review complete")
+                except Exception as e:
+                    task.status = TaskStatus.FAILED
+                    task.error = str(e)
+
+                task.completed_at = time.time()
+                self._update_context(task)
+                return task
+
+            # FINALIZE_PLAN: Architect incorporates coder feedback
+            if task.task_type == "finalize_plan":
+                draft_plan = self.state["context"].get("draft_plan", "")
+                plan_review = self.state["context"].get("plan_review", "")
+                architect_config = self.executor._get_agent_config(AgentRole.ARCHITECT)
+
+                payload = {
+                    "mode": "finalize",
+                    "draft_plan": draft_plan,
+                    "coder_feedback": plan_review,
+                    "config": {
+                        "model_url": architect_config.get("url", "http://localhost:1233/v1"),
+                        "model_name": architect_config.get("model", "local-model"),
+                        "api_type": architect_config.get("api_type", "openai"),
+                        "temperature": 0.6,
+                        "max_tokens": 4000,
+                        "timeout": architect_config.get("timeout", 600)
+                    }
+                }
+
+                self._log_prompt("FINALIZE", "ARCHITECT", {"system_prompt": "FINALIZE_PROMPT", "user_message": plan_review, "draft_plan": draft_plan, "coder_feedback": plan_review}, mode="finalize")
+
+                try:
+                    output = self._run_external_agent("architect", payload)
+                    if output.get("status") == "error":
+                        raise Exception(output.get("error"))
+
+                    final_plan = output.get("plan_yaml") or output.get("result", "")
+                    self.state["context"]["final_plan"] = final_plan
+                    self.state["context"]["plan_yaml"] = final_plan  # For backward compat
+                    task.result = final_plan
+                    task.status = TaskStatus.COMPLETED
+                    self._set_project_type_from_plan(final_plan)
+                    print(f"  ✓ Final plan produced ({len(final_plan)} chars)")
+                except Exception as e:
+                    task.status = TaskStatus.FAILED
+                    task.error = str(e)
+
+                task.completed_at = time.time()
+                self._update_context(task)
+                return task
+
+            # BUILD_FROM_PLAN: Coder builds all code (owns imports — no _fix_relative_imports)
+            if task.task_type == "build_from_plan":
+                final_plan = self.state["context"].get("final_plan", "")
+                job_spec = self.state["context"].get("job_spec", self.state["context"].get("job_scope", ""))
+                coder_config = self.executor._get_agent_config(AgentRole.CODER)
+
+                payload = {
+                    "mode": "build",
+                    "plan_yaml": final_plan,
+                    "job_spec": job_spec,
+                    "config": {
+                        "model_url": coder_config.get("url", "http://localhost:1233/v1"),
+                        "model_name": coder_config.get("model", "local-model"),
+                        "api_type": coder_config.get("api_type", "openai"),
+                        "temperature": 0.2,
+                        "max_tokens": coder_config.get("max_tokens", 25000),
+                        "timeout": coder_config.get("timeout", 1200)
+                    }
+                }
+
+                self._log_prompt("BUILD", "CODER", {"system_prompt": "BUILD_PROMPT", "user_message": final_plan, "plan_yaml": final_plan, "job_spec": job_spec}, mode="build")
+
+                try:
+                    output = self._run_external_agent("coder", payload)
+                    if output.get("status") == "error":
+                        raise Exception(output.get("error"))
+
+                    result_text = output.get("result", "")
+                    result_text = self._clean_code_output(result_text)
+
+                    # NOTE: We do NOT call _fix_relative_imports — the coder owns imports
+                    self.state["context"]["latest_code"] = result_text
+                    task.result = result_text
+                    task.status = TaskStatus.COMPLETED
+                    print(f"  ✓ Code built ({len(result_text)} chars)")
+                except Exception as e:
+                    task.status = TaskStatus.FAILED
+                    task.error = str(e)
+
+                task.completed_at = time.time()
+                self._update_context(task)
+                return task
+
+            # COMPLIANCE_REVIEW: Reviewer checks code against plan
+            if task.task_type == "compliance_review":
+                final_plan = self.state["context"].get("final_plan", "")
+                latest_code = self.state["context"].get("latest_code", "")
+                reviewer_config = self.executor._get_agent_config(AgentRole.REVIEWER)
+
+                payload = {
+                    "mode": "compliance",
+                    "plan_yaml": final_plan,
+                    "code": latest_code,
+                    "config": {
+                        "model_url": reviewer_config.get("url", "http://localhost:1233/v1"),
+                        "model_name": reviewer_config.get("model", "local-model"),
+                        "api_type": reviewer_config.get("api_type", "openai"),
+                        "temperature": 0.3,
+                        "max_tokens": 4000,
+                        "timeout": reviewer_config.get("timeout", 600)
+                    }
+                }
+
+                self._log_prompt("COMPLIANCE", "REVIEWER", {"system_prompt": "COMPLIANCE_PROMPT", "user_message": "(plan+code)", "plan_yaml": final_plan, "code": latest_code[:2000]}, mode="compliance")
+
+                try:
+                    output = self._run_external_agent("reviewer", payload)
+                    if output.get("status") == "error":
+                        raise Exception(output.get("error"))
+
+                    result_text = output.get("result", "")
+                    task.result = result_text
+
+                    # Check if revision is needed
+                    if "NEEDS_REVISION" in result_text.upper() or "STATUS: NEEDS_REVISION" in result_text.upper():
+                        task.metadata["needs_revision"] = True
+                        task.metadata["final_plan"] = final_plan
+                        print(f"  ⚠ Compliance review: NEEDS_REVISION")
+                    else:
+                        print(f"  ✓ Compliance review: APPROVED")
+
+                    task.status = TaskStatus.COMPLETED
+                except Exception as e:
+                    task.status = TaskStatus.FAILED
+                    task.error = str(e)
+
+                task.completed_at = time.time()
+                self._update_context(task)
+                return task
+
             # Debug
             if task.assigned_role == AgentRole.DEBUGGER:
                 if task.task_type == "semantic_audit":
@@ -2510,6 +2755,9 @@ Be specific and reference actual code from the project."""
         
         clarifier_config = self.executor._get_agent_config(AgentRole.CLARIFIER)
         
+        # Check if structured output is requested (collaborative workflow)
+        output_format = task.metadata.get("output_format", "")
+
         synthesis_payload = {
             "mode": "synthesize",
             "user_request": task.metadata.get("user_request", ""),
@@ -2524,29 +2772,46 @@ Be specific and reference actual code from the project."""
                 "timeout": clarifier_config.get("timeout", 300)
             }
         }
-        
+
+        # Pass output_format for structured job spec
+        if output_format:
+            synthesis_payload["output_format"] = output_format
+
+        # Log the prompt
+        self._log_prompt("SYNTHESIZE", "CLARIFIER", {
+            "system_prompt": "SYNTHESIZE_STRUCTURED_PROMPT" if output_format == "structured" else "SYNTHESIZE_PROMPT",
+            "user_message": f"Request: {user_request[:200]}... Q&A: {result[:200]}..."
+        }, mode=f"synthesize_{output_format}" if output_format else "synthesize")
+
         try:
             synthesis_output = self._run_external_agent("clarifier", synthesis_payload)
             job_scope = synthesis_output.get("job_scope", "")
-            
+
             if not job_scope:
                 # Fallback to raw Q&A if synthesis failed
                 print("⚠ Synthesis failed, using raw Q&A")
                 job_scope = f"ORIGINAL REQUEST:\n{user_request}\n\nCLARIFICATION Q&A:\n{result}\n\nANSWERS:\n{answers_text}"
             else:
                 print("✓ Job scope synthesized")
-                
+
+            # Store job_spec for collaborative workflow
+            if output_format == "structured":
+                job_spec = synthesis_output.get("job_spec", job_scope)
+                self.state["context"]["job_spec"] = job_spec
+
         except Exception as e:
             print(f"⚠ Synthesis error: {e}, using raw Q&A")
             job_scope = f"ORIGINAL REQUEST:\n{user_request}\n\nCLARIFICATION Q&A:\n{result}\n\nANSWERS:\n{answers_text}"
-        
+            if output_format == "structured":
+                self.state["context"]["job_spec"] = job_scope
+
         if self.state["context"].get("clarification_assumed_defaults"):
             job_scope += "\n\nASSUMPTIONS:\n- No clarifier answers were provided; agent should use simplest reasonable defaults."
 
         self.state["context"]['job_scope'] = job_scope
         self.state["context"]['clarification'] = job_scope  # Keep for backward compatibility
         self.state["context"]['user_answers'] = answers_text
-        
+
         print("\n✓ Clarification complete, proceeding with workflow...")
     
     def _handle_revision_cycle(self, review_tasks: List[Task]) -> bool:
@@ -2563,41 +2828,50 @@ Be specific and reference actual code from the project."""
         if not needs_revision:
             return False
         
-        # Find the coding task
-        code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution")), None)
+        # Find the coding task (also check build_from_plan for collaborative workflow)
+        code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution", "build_from_plan")), None)
         if not code_task:
             return False
-        
+
         # Check revision count
         if code_task.revision_count >= code_task.max_revisions:
             print(f"\n⚠ Max revisions ({code_task.max_revisions}) reached, proceeding anyway")
             return False
-        
+
         print(f"\n🔄 Revision cycle {code_task.revision_count + 1}/{code_task.max_revisions}")
-        
+
         # Collect review feedback
         feedback = []
         for rt in review_tasks:
             if rt.result and rt.metadata.get("needs_revision"):
                 feedback.append(f"[{rt.task_id}]: {rt.result}")
-        
-# --- START CHANGE 2 ---
+
+        # Build revision metadata
+        revision_metadata = {
+            "revision_feedback": "\n\n".join(feedback),
+            "original_code": code_task.result,
+            "user_request": self.state["context"].get("user_request", ""),
+            "is_revision": True
+        }
+
+        # Include final_plan when revision is triggered from compliance review
+        for rt in review_tasks:
+            if rt.task_type == "compliance_review" and rt.metadata.get("final_plan"):
+                revision_metadata["final_plan"] = rt.metadata["final_plan"]
+                break
+        if "final_plan" not in revision_metadata and self.state["context"].get("final_plan"):
+            revision_metadata["final_plan"] = self.state["context"]["final_plan"]
+
         # Create revision task
         revision_task = Task(
             task_id=f"T_revision_{code_task.revision_count + 1}",
-            task_type="revision",  # Changed from "coding" to "revision"
+            task_type="revision",
             description="Revise code based on review feedback",
             assigned_role=AgentRole.CODER,
             status=TaskStatus.PENDING,
             priority=10,
-            metadata={
-                "revision_feedback": "\n\n".join(feedback),
-                "original_code": code_task.result,
-                "user_request": self.state["context"].get("user_request", ""),
-                "is_revision": True  # Flag for system prompt
-            }
+            metadata=revision_metadata
         )
-# --- END CHANGE 2 ---
         revision_task.revision_count = code_task.revision_count + 1
         
         # Execute revision
@@ -2669,6 +2943,8 @@ Be specific and reference actual code from the project."""
             if not self.task_queue:
                 print("⚠ No tasks in bugfix workflow queue")
                 return
+        elif workflow_type == "collaborative":
+            self._create_collaborative_workflow(user_request)
         else:
             raise ValueError(f"Unknown workflow type: {workflow_type}")
         
@@ -2931,6 +3207,80 @@ Be specific and reference actual code from the project."""
             dependencies=["T008_document"]
         ))
     
+    def _create_collaborative_workflow(self, user_request: str):
+        """Create collaborative workflow: clarify → draft plan → coder reviews → final plan → build → compliance"""
+
+        # T001: Clarification (structured output)
+        self.add_task(Task(
+            task_id="T001_clarify",
+            task_type="clarification",
+            description="Clarify requirements and produce structured job spec",
+            assigned_role=AgentRole.CLARIFIER,
+            status=TaskStatus.PENDING,
+            priority=10,
+            metadata={"user_request": user_request, "output_format": "structured"}
+        ))
+
+        # T002: Draft Plan
+        self.add_task(Task(
+            task_id="T002_draft_plan",
+            task_type="draft_plan",
+            description="Produce draft architecture plan from job spec",
+            assigned_role=AgentRole.ARCHITECT,
+            status=TaskStatus.PENDING,
+            priority=9,
+            dependencies=["T001_clarify"],
+            metadata={"user_request": user_request}
+        ))
+
+        # T003: Plan Review (Coder reviews the draft)
+        self.add_task(Task(
+            task_id="T003_plan_review",
+            task_type="plan_review",
+            description="Coder reviews draft plan before finalization",
+            assigned_role=AgentRole.CODER,
+            status=TaskStatus.PENDING,
+            priority=8,
+            dependencies=["T002_draft_plan"],
+            metadata={"user_request": user_request}
+        ))
+
+        # T004: Final Plan (Architect incorporates coder feedback)
+        self.add_task(Task(
+            task_id="T004_final_plan",
+            task_type="finalize_plan",
+            description="Architect finalizes plan with coder feedback",
+            assigned_role=AgentRole.ARCHITECT,
+            status=TaskStatus.PENDING,
+            priority=7,
+            dependencies=["T003_plan_review"],
+            metadata={"user_request": user_request}
+        ))
+
+        # T005: Build (Coder builds all code from final plan)
+        self.add_task(Task(
+            task_id="T005_build",
+            task_type="build_from_plan",
+            description="Build all code from finalized plan",
+            assigned_role=AgentRole.CODER,
+            status=TaskStatus.PENDING,
+            priority=6,
+            dependencies=["T004_final_plan"],
+            metadata={"user_request": user_request}
+        ))
+
+        # T006: Compliance Review
+        self.add_task(Task(
+            task_id="T006_compliance",
+            task_type="compliance_review",
+            description="Verify code implements the plan correctly",
+            assigned_role=AgentRole.REVIEWER,
+            status=TaskStatus.PENDING,
+            priority=5,
+            dependencies=["T005_build"],
+            metadata={"user_request": user_request}
+        ))
+
     def _create_review_workflow(self, code: str):
         """Create workflow for reviewing existing code"""
         
@@ -3630,7 +3980,7 @@ OUTPUT YOUR COMPLETE REVISED CODE BELOW:
         }
     
         # Store latest code separately
-        if task.task_type in ("coding", "revision", "plan_execution") and task.result:
+        if task.task_type in ("coding", "revision", "plan_execution", "build_from_plan") and task.result:
             self.state["context"]["latest_code"] = task.result
     
         # NEW: Store parsed plan for downstream access

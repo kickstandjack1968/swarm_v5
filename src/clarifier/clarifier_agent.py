@@ -98,6 +98,36 @@ OUTPUT RULES:
 2. No introductory text
 3. Integrate answers into a unified specification
 4. Prioritize user answers over original if contradictions"""
+
+    SYNTHESIZE_STRUCTURED_PROMPT = """You are a Technical Project Manager producing a STRUCTURED JOB SPECIFICATION.
+
+From the original request and Q&A session, produce a document with EXACTLY these sections:
+
+## PROJECT OVERVIEW
+One paragraph describing what this software does.
+
+## FUNCTIONAL REQUIREMENTS
+Numbered list of specific behaviors the software must exhibit.
+
+## INPUT/OUTPUT SPECIFICATION
+- What inputs does the program accept (files, CLI args, stdin)?
+- What outputs does it produce (files, stdout, return values)?
+- What formats are used?
+
+## ERROR HANDLING
+- What errors should be handled?
+- What should happen when they occur?
+
+## CONSTRAINTS
+- External libraries allowed/needed
+- Environment requirements
+- Performance expectations (if any)
+
+## ACCEPTANCE CRITERIA
+Numbered list of testable criteria that define "done".
+
+Do NOT include implementation details (no class names, no file structure, no import paths).
+Output ONLY the structured job specification."""
     
     def process(self, input_data: dict) -> dict:
         """Process clarification or synthesis request."""
@@ -156,10 +186,17 @@ Analyze these requirements and ask clarifying questions to fully understand what
     
     def _synthesize(self, input_data: dict, user_request: str) -> dict:
         """Synthesize Q&A into job scope."""
-        
+
         questions = input_data.get("questions", "")
         answers = input_data.get("answers", "")
-        
+        output_format = input_data.get("output_format", "")
+
+        # Choose prompt based on output format
+        if output_format == "structured":
+            system_prompt = self.SYNTHESIZE_STRUCTURED_PROMPT
+        else:
+            system_prompt = self.SYNTHESIZE_PROMPT
+
         user_message = f"""ORIGINAL REQUEST:
 {user_request}
 
@@ -170,19 +207,25 @@ USER ANSWERS:
 {answers}
 
 Synthesize these into a complete, unified Job Scope."""
-        
+
         messages = [
-            {"role": "system", "content": self.SYNTHESIZE_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
         ]
-        
+
         response = self.call_llm(messages)
         cleaned = self.clean_response(response)
-        
-        return {
+
+        result = {
             "status": "success",
             "job_scope": cleaned
         }
+
+        # Also return as job_spec key for collaborative workflow
+        if output_format == "structured":
+            result["job_spec"] = cleaned
+
+        return result
 
 
 if __name__ == "__main__":

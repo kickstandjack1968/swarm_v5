@@ -140,35 +140,151 @@ CRITICAL RULES:
 4. execution_order MUST have dependencies before dependents
 
 Keep it SIMPLE. Output ONLY the YAML."""
+
+    DRAFT_PLAN_PROMPT = """You are an expert software architect creating a DRAFT YAML execution plan.
+
+A coder will review this plan before it's finalized, so focus on WHAT needs to be built, not HOW to import it.
+
+OUTPUT: Valid YAML with this structure:
+
+```yaml
+program:
+  name: "project_name"
+  description: "What it does"
+  type: "cli|library|service"
+
+architecture:
+  pattern: "simple|modular"
+  entry_point: "main.py"
+
+files:
+  - name: "config.py"
+    purpose: "Configuration management"
+    dependencies: []
+    exports:
+      - name: "Settings"
+        type: "class"
+        description: "Holds application configuration"
+    needs_from: {}
+    requirements:
+      - "Load config from file or environment"
+
+  - name: "main.py"
+    purpose: "Entry point"
+    dependencies: ["config.py"]
+    exports: []
+    needs_from:
+      config.py: ["Settings"]
+    requirements:
+      - "Parse CLI arguments"
+      - "Initialize and run"
+
+execution_order: ["config.py", "main.py"]
+```
+
+CRITICAL RULES:
+1. exports lists WHAT each file defines — name, type, and a short description
+2. needs_from declares WHAT names a file needs from which other file (the coder decides HOW to import)
+3. dependencies MUST include every file referenced in needs_from
+4. execution_order MUST have dependencies before dependents
+5. Keep it SIMPLE. If it's a simple program, use few files. Don't over-engineer.
+
+Output ONLY the YAML."""
+
+    FINALIZE_PROMPT = """You are an expert software architect FINALIZING a plan based on a coder's review.
+
+The coder reviewed your draft plan and provided feedback. Adjust accordingly.
+
+RULES:
+1. Address every concern the coder raised
+2. If the coder suggests structural changes, adopt them if reasonable
+3. If you disagree with the coder, explain why in a YAML comment
+4. The plan must still use the same YAML format (with needs_from, NOT imports_from)
+5. Output the COMPLETE revised YAML plan"""
     
     def process(self, input_data: dict) -> dict:
         """Generate YAML execution plan."""
-        
+
+        mode = input_data.get("mode", "default")
+
+        if mode == "draft":
+            return self._process_draft(input_data)
+        elif mode == "finalize":
+            return self._process_finalize(input_data)
+        else:
+            return self._process_default(input_data)
+
+    def _process_draft(self, input_data: dict) -> dict:
+        """Draft plan mode — receives job_spec, produces draft YAML plan."""
+        job_spec = input_data.get("job_spec", "")
+        if not job_spec:
+            return {"status": "error", "ok": False, "error": "No job_spec provided for draft mode"}
+
+        user_prompt = f"Create a YAML execution plan for this project:\n\n{job_spec}\n\nOutput the YAML plan:"
+
+        messages = [
+            {"role": "system", "content": self.DRAFT_PLAN_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ]
+
+        response = self.call_llm(messages, temperature=0.6)
+        return self._parse_and_validate(response)
+
+    def _process_finalize(self, input_data: dict) -> dict:
+        """Finalize plan mode — receives draft_plan + coder_feedback, produces final YAML plan."""
+        draft_plan = input_data.get("draft_plan", "")
+        coder_feedback = input_data.get("coder_feedback", "")
+
+        if not draft_plan:
+            return {"status": "error", "ok": False, "error": "No draft_plan provided for finalize mode"}
+
+        user_prompt = f"""DRAFT PLAN:
+```yaml
+{draft_plan}
+```
+
+CODER'S REVIEW:
+{coder_feedback}
+
+Revise the plan based on the coder's feedback. Output the COMPLETE revised YAML plan:"""
+
+        messages = [
+            {"role": "system", "content": self.FINALIZE_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ]
+
+        response = self.call_llm(messages, temperature=0.6)
+        return self._parse_and_validate(response)
+
+    def _process_default(self, input_data: dict) -> dict:
+        """Default mode — original behavior for backward compatibility."""
         # Get user request
         user_request = input_data.get("user_request") or input_data.get("user_message", "")
         if not user_request:
             return {"status": "error", "ok": False, "error": "No user_request provided"}
-        
+
         clarification = input_data.get("clarification", "")
-        
+
         # Use custom system prompt if provided
         system_prompt = input_data.get("system_prompt") or self.SYSTEM_PROMPT
-        
+
         # Build user prompt
         user_prompt = f"Create a YAML execution plan for:\n\n{user_request}"
         if clarification:
             user_prompt += f"\n\nCLARIFICATION:\n{clarification}"
         user_prompt += "\n\nOutput the YAML plan:"
-        
+
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ]
-        
+
         # Call LLM
         response = self.call_llm(messages, temperature=0.6)
-        
-        # Extract YAML
+        return self._parse_and_validate(response)
+    
+    def _parse_and_validate(self, response: str) -> dict:
+        """Shared logic: extract YAML from LLM response, validate, and return result dict."""
         yaml_str = self._extract_yaml(response)
         if not yaml_str:
             return {
@@ -177,23 +293,19 @@ Keep it SIMPLE. Output ONLY the YAML."""
                 "error": "Could not extract YAML from response",
                 "raw_response": response
             }
-        
-        # Check forbidden filename
+
         if FORBIDDEN_FILENAME in yaml_str:
             return {
                 "status": "error",
                 "ok": False,
                 "error": f"Plan contains forbidden file: {FORBIDDEN_FILENAME}"
             }
-        
-        # Parse and validate
+
         try:
             plan = yaml.safe_load(yaml_str)
             self._validate_plan(plan)
-            
-            # Normalize
             normalized = yaml.dump(plan, default_flow_style=False, sort_keys=False)
-            
+
             return {
                 "status": "success",
                 "ok": True,
@@ -201,7 +313,7 @@ Keep it SIMPLE. Output ONLY the YAML."""
                 "plan_yaml": normalized,
                 "raw_response": response
             }
-            
+
         except yaml.YAMLError as e:
             return {
                 "status": "error",
@@ -216,7 +328,7 @@ Keep it SIMPLE. Output ONLY the YAML."""
                 "error": f"Validation error: {e}",
                 "extracted_yaml": yaml_str
             }
-    
+
     def _extract_yaml(self, response: str) -> str:
         """Extract YAML from response."""
         # Try markdown block
@@ -280,20 +392,26 @@ Keep it SIMPLE. Output ONLY the YAML."""
             f.setdefault('purpose', '')
             f.setdefault('dependencies', [])
             f.setdefault('exports', [])
-            f.setdefault('imports_from', {})
             f.setdefault('requirements', [])
-        
+
+            # Accept needs_from as equivalent to imports_from
+            if 'needs_from' in f and 'imports_from' not in f:
+                f['imports_from'] = f['needs_from']
+            f.setdefault('imports_from', {})
+            f.setdefault('needs_from', f.get('imports_from', {}))
+
         # Validate cross-references
         for f in plan['files']:
             name = f['name']
-            
+
             # Check dependencies exist
             for dep in f['dependencies']:
                 if dep not in file_names:
                     raise ValueError(f"File '{name}' depends on unknown file '{dep}'")
-            
-            # Check imports_from references valid files and exports
-            for source, imports in f.get('imports_from', {}).items():
+
+            # Check imports_from/needs_from references valid files and exports
+            import_map = f.get('imports_from', {}) or f.get('needs_from', {})
+            for source, imports in (import_map or {}).items():
                 if source not in file_names:
                     raise ValueError(f"File '{name}' imports from unknown file '{source}'")
                 
