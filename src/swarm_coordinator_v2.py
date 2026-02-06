@@ -715,16 +715,16 @@ class SwarmCoordinator:
                 }
             },
             "agent_parameters": {
-                "architect": {"temperature": 0.6, "max_tokens": 3000},
-                "clarifier": {"temperature": 0.7, "max_tokens": 2000},
-                "coder": {"temperature": 0.2, "max_tokens": 6000},
-                "reviewer": {"temperature": 0.8, "max_tokens": 3000},
-                "tester": {"temperature": 0.7, "max_tokens": 4000},
-                "optimizer": {"temperature": 0.6, "max_tokens": 4000},
-                "documenter": {"temperature": 0.7, "max_tokens": 3000},
-                "debugger": {"temperature": 0.6, "max_tokens": 4000},
-                "security": {"temperature": 0.8, "max_tokens": 3000},
-                "verifier": {"temperature": 0.3, "max_tokens": 3000}
+                "architect": {"temperature": 0.5, "max_tokens": 35000, "top_p": 0.85},
+                "clarifier": {"temperature": 0.7, "max_tokens": 35000, "top_p": 0.9},
+                "coder": {"temperature": 0.2, "max_tokens": 35000, "top_p": 0.85},
+                "reviewer": {"temperature": 0.8, "max_tokens": 35000, "top_p": 0.95},
+                "tester": {"temperature": 0.7, "max_tokens": 35000, "top_p": 0.9},
+                "optimizer": {"temperature": 0.6, "max_tokens": 35000, "top_p": 0.85},
+                "documenter": {"temperature": 0.7, "max_tokens": 35000, "top_p": 0.9},
+                "debugger": {"temperature": 0.6, "max_tokens": 35000, "top_p": 0.85},
+                "security": {"temperature": 0.8, "max_tokens": 35000, "top_p": 0.95},
+                "verifier": {"temperature": 0.3, "max_tokens": 35000, "top_p": 0.85}
             },
             "workflow": {
                 "max_iterations": 3,
@@ -962,51 +962,59 @@ PROJECT STRUCTURE
         if not project_dir:
             return
         
-        # Save code - handle multi-file output
-        code_task = next((t for t in reversed(self.completed_tasks) if t.task_type in ("coding", "plan_execution", "revision")), None)
-        if code_task and code_task.result:
-            files_dict = self._parse_multi_file_output(code_task.result)
-            
-            if files_dict:
-                # Multi-file output detected
-                for filename, content in files_dict.items():
-                    # Normalize path separators
-                    filename = filename.replace('\\', '/')
-                    
-                    # INTELLIGENT ROUTING
-                    if filename.startswith("src/"):
-                        # Explicitly marked for src -> Strip prefix, go to src/
-                        rel_path = filename[len("src/"):]
-                        base_dir = os.path.join(project_dir, "src")
-                    elif filename.startswith("tests/"):
-                        # Explicitly marked for tests -> Go to root/tests
-                        rel_path = filename 
-                        base_dir = project_dir 
-                    elif filename.startswith("docs/"):
-                        # Explicitly marked for docs -> Go to root/docs
-                        rel_path = filename
-                        base_dir = project_dir
-                    else:
-                        # Implicit source file -> Go to src/ (SAFE DEFAULT)
-                        rel_path = filename
-                        base_dir = os.path.join(project_dir, "src")
+        # Save code - merge all code-producing tasks (build + revisions)
+        # Earlier tasks provide the baseline, later revisions override specific files
+        code_tasks = [t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan") and t.result]
+        files_dict = {}
+        for code_task in code_tasks:
+            parsed = self._parse_multi_file_output(code_task.result)
+            if parsed:
+                files_dict.update(parsed)  # Later tasks override earlier ones
 
-                    code_file = os.path.join(base_dir, rel_path)
-                    
-                    # Ensure directory exists
-                    os.makedirs(os.path.dirname(code_file), exist_ok=True)
-                    
-                    with open(code_file, 'w', encoding='utf-8') as f:
-                        f.write(content)
-                print(f"   ✓ Created {len(files_dict)} files (smart routed)")
+        if not files_dict and code_tasks:
+            # Single file output fallback — use last task
+            code_task = code_tasks[-1]
 
-            else:
-                # Single file output (legacy behavior) - assume source
-                project_name = self.state["project_info"]["project_name"]
-                code_file = os.path.join(project_dir, "src", f"{project_name}.py")
-                
+        if files_dict:
+            # Multi-file output detected
+            for filename, content in files_dict.items():
+                # Normalize path separators
+                filename = filename.replace('\\', '/')
+
+                # INTELLIGENT ROUTING
+                if filename.startswith("src/"):
+                    # Explicitly marked for src -> Strip prefix, go to src/
+                    rel_path = filename[len("src/"):]
+                    base_dir = os.path.join(project_dir, "src")
+                elif filename.startswith("tests/"):
+                    # Explicitly marked for tests -> Go to root/tests
+                    rel_path = filename
+                    base_dir = project_dir
+                elif filename.startswith("docs/"):
+                    # Explicitly marked for docs -> Go to root/docs
+                    rel_path = filename
+                    base_dir = project_dir
+                else:
+                    # Implicit source file -> Go to src/ (SAFE DEFAULT)
+                    rel_path = filename
+                    base_dir = os.path.join(project_dir, "src")
+
+                code_file = os.path.join(base_dir, rel_path)
+
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(code_file), exist_ok=True)
+
                 with open(code_file, 'w', encoding='utf-8') as f:
-                    f.write(code_task.result)
+                    f.write(content)
+            print(f"   ✓ Created {len(files_dict)} files (smart routed)")
+
+        elif code_tasks:
+            # Single file output (legacy behavior) - assume source
+            project_name = self.state["project_info"]["project_name"]
+            code_file = os.path.join(project_dir, "src", f"{project_name}.py")
+
+            with open(code_file, 'w', encoding='utf-8') as f:
+                f.write(code_tasks[-1].result)
         self._generate_init_files(project_dir)
 
 
@@ -1379,7 +1387,7 @@ PROJECT STRUCTURE
     
     def _create_requirements_txt(self, project_dir: str):
         """Generate requirements.txt with PINNED GOLDEN STACK versions."""
-        code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution")), None)
+        code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan")), None)
         if not code_task or not code_task.result:
             return
         
@@ -1512,7 +1520,8 @@ PROJECT STRUCTURE
             "user_message": payload.get("user_message", ""),
         }
         # Include any extra keys from payload (job_spec, plan_yaml, etc.)
-        for key in ("job_spec", "plan_yaml", "code", "draft_plan", "coder_feedback"):
+        for key in ("job_spec", "plan_yaml", "code", "draft_plan", "coder_feedback",
+                     "environment_context", "revision_feedback", "original_code", "result"):
             if key in payload:
                 log_entry[key] = payload[key]
 
@@ -1725,8 +1734,8 @@ PROJECT STRUCTURE
                         "model_url": architect_config.get("url", "http://localhost:1233/v1"),
                         "model_name": architect_config.get("model", "local-model"),
                         "api_type": architect_config.get("api_type", "openai"),
-                        "temperature": 0.6,
-                        "max_tokens": 4000,
+                        "temperature": architect_config.get("temperature", 0.6),
+                        "max_tokens": architect_config.get("max_tokens", 35000),
                         "timeout": architect_config.get("timeout", 600)
                     }
                 }
@@ -1763,8 +1772,8 @@ PROJECT STRUCTURE
                         "model_url": coder_config.get("url", "http://localhost:1233/v1"),
                         "model_name": coder_config.get("model", "local-model"),
                         "api_type": coder_config.get("api_type", "openai"),
-                        "temperature": 0.3,
-                        "max_tokens": 4000,
+                        "temperature": coder_config.get("temperature", 0.3),
+                        "max_tokens": coder_config.get("max_tokens", 35000),
                         "timeout": coder_config.get("timeout", 1200)
                     }
                 }
@@ -1803,8 +1812,8 @@ PROJECT STRUCTURE
                         "model_url": architect_config.get("url", "http://localhost:1233/v1"),
                         "model_name": architect_config.get("model", "local-model"),
                         "api_type": architect_config.get("api_type", "openai"),
-                        "temperature": 0.6,
-                        "max_tokens": 4000,
+                        "temperature": architect_config.get("temperature", 0.6),
+                        "max_tokens": architect_config.get("max_tokens", 35000),
                         "timeout": architect_config.get("timeout", 600)
                     }
                 }
@@ -1837,21 +1846,25 @@ PROJECT STRUCTURE
                 job_spec = self.state["context"].get("job_spec", self.state["context"].get("job_scope", ""))
                 coder_config = self.executor._get_agent_config(AgentRole.CODER)
 
+                # Build environment context so coder knows how to reach LLMs
+                env_context = self._build_environment_context()
+
                 payload = {
                     "mode": "build",
                     "plan_yaml": final_plan,
                     "job_spec": job_spec,
+                    "environment_context": env_context,
                     "config": {
                         "model_url": coder_config.get("url", "http://localhost:1233/v1"),
                         "model_name": coder_config.get("model", "local-model"),
                         "api_type": coder_config.get("api_type", "openai"),
-                        "temperature": 0.2,
-                        "max_tokens": coder_config.get("max_tokens", 25000),
+                        "temperature": coder_config.get("temperature", 0.2),
+                        "max_tokens": coder_config.get("max_tokens", 35000),
                         "timeout": coder_config.get("timeout", 1200)
                     }
                 }
 
-                self._log_prompt("BUILD", "CODER", {"system_prompt": "BUILD_PROMPT", "user_message": final_plan, "plan_yaml": final_plan, "job_spec": job_spec}, mode="build")
+                self._log_prompt("BUILD", "CODER", {"system_prompt": "BUILD_PROMPT", "user_message": f"PLAN:\n{final_plan}\n\nJOB_SPEC:\n{job_spec}\n\nENV:\n{env_context}", "plan_yaml": final_plan, "job_spec": job_spec, "environment_context": env_context}, mode="build")
 
                 try:
                     output = self._run_external_agent("coder", payload)
@@ -1878,23 +1891,25 @@ PROJECT STRUCTURE
             if task.task_type == "compliance_review":
                 final_plan = self.state["context"].get("final_plan", "")
                 latest_code = self.state["context"].get("latest_code", "")
+                job_spec = self.state["context"].get("job_spec", self.state["context"].get("job_scope", ""))
                 reviewer_config = self.executor._get_agent_config(AgentRole.REVIEWER)
 
                 payload = {
                     "mode": "compliance",
                     "plan_yaml": final_plan,
                     "code": latest_code,
+                    "job_spec": job_spec,
                     "config": {
                         "model_url": reviewer_config.get("url", "http://localhost:1233/v1"),
                         "model_name": reviewer_config.get("model", "local-model"),
                         "api_type": reviewer_config.get("api_type", "openai"),
-                        "temperature": 0.3,
-                        "max_tokens": 4000,
+                        "temperature": reviewer_config.get("temperature", 0.3),
+                        "max_tokens": reviewer_config.get("max_tokens", 35000),
                         "timeout": reviewer_config.get("timeout", 600)
                     }
                 }
 
-                self._log_prompt("COMPLIANCE", "REVIEWER", {"system_prompt": "COMPLIANCE_PROMPT", "user_message": "(plan+code)", "plan_yaml": final_plan, "code": latest_code[:2000]}, mode="compliance")
+                self._log_prompt("COMPLIANCE", "REVIEWER", {"system_prompt": "COMPLIANCE_PROMPT", "user_message": f"PLAN + CODE + JOB_SPEC ({len(latest_code)} chars code)", "plan_yaml": final_plan, "code": latest_code, "job_spec": job_spec}, mode="compliance")
 
                 try:
                     output = self._run_external_agent("reviewer", payload)
@@ -1903,6 +1918,9 @@ PROJECT STRUCTURE
 
                     result_text = output.get("result", "")
                     task.result = result_text
+
+                    # Log the compliance result
+                    self._log_prompt("COMPLIANCE_RESULT", "REVIEWER", {"system_prompt": "COMPLIANCE_PROMPT", "user_message": "RESULT", "result": result_text}, mode="compliance")
 
                     # Check if revision is needed
                     if "NEEDS_REVISION" in result_text.upper() or "STATUS: NEEDS_REVISION" in result_text.upper():
@@ -2044,8 +2062,8 @@ Be specific and reference actual code from the project."""
                         "model_url": ver_config.get("url", "http://localhost:1233/v1"),
                         "model_name": ver_config.get("model", "local-model"),
                         "api_type": ver_config.get("api_type", "openai"),
-                        "temperature": 0.3,
-                        "max_tokens": 3000,
+                        "temperature": ver_config.get("temperature", 0.3),
+                        "max_tokens": ver_config.get("max_tokens", 35000),
                         "timeout": ver_config.get("timeout", 600)
                     }
                 }
@@ -2054,7 +2072,7 @@ Be specific and reference actual code from the project."""
                     output = self._run_external_agent("verifier", payload)
                     if output.get("status") == "error":
                         raise Exception(output.get("error"))
-                    
+
                     result = output.get("result", "")
                     task.result = result
 
@@ -2104,8 +2122,8 @@ Be specific and reference actual code from the project."""
                         "model_url": clarifier_config.get("url", "http://localhost:1233/v1"),
                         "model_name": clarifier_config.get("model", "local-model"),
                         "api_type": clarifier_config.get("api_type", "openai"),
-                        "temperature": 0.7,
-                        "max_tokens": 2000,
+                        "temperature": clarifier_config.get("temperature", 0.7),
+                        "max_tokens": clarifier_config.get("max_tokens", 35000),
                         "timeout": clarifier_config.get("timeout", 300)
                     }
                 }
@@ -2147,8 +2165,8 @@ Be specific and reference actual code from the project."""
                             "model_url": architect_config.get("url", "http://localhost:1233/v1"),
                             "model_name": architect_config.get("model", "local-model"),
                             "api_type": architect_config.get("api_type", "openai"),
-                            "temperature": 0.6,
-                            "max_tokens": 3000,
+                            "temperature": architect_config.get("temperature", 0.6),
+                            "max_tokens": architect_config.get("max_tokens", 35000),
                             "timeout": architect_config.get("timeout", 600)
                         }
                     }
@@ -2189,8 +2207,8 @@ Be specific and reference actual code from the project."""
                         "model_url": coder_config.get("url", "http://localhost:1233/v1"),
                         "model_name": coder_config.get("model", "local-model"),
                         "api_type": coder_config.get("api_type", "openai"),
-                        "temperature": 0.5,
-                        "max_tokens": 6000,
+                        "temperature": coder_config.get("temperature", 0.2),
+                        "max_tokens": coder_config.get("max_tokens", 35000),
                         "timeout": coder_config.get("timeout", 1200)
                     }
                 }
@@ -2259,8 +2277,8 @@ Be specific and reference actual code from the project."""
                         "model_url": reviewer_config.get("url", "http://localhost:1233/v1"),
                         "model_name": reviewer_config.get("model", "local-model"),
                         "api_type": reviewer_config.get("api_type", "openai"),
-                        "temperature": 0.8,
-                        "max_tokens": 3000,
+                        "temperature": reviewer_config.get("temperature", 0.8),
+                        "max_tokens": reviewer_config.get("max_tokens", 35000),
                         "timeout": reviewer_config.get("timeout", 600)
                     }
                 }
@@ -2306,8 +2324,8 @@ Be specific and reference actual code from the project."""
                         "model_url": tester_config.get("url", "http://localhost:1233/v1"),
                         "model_name": tester_config.get("model", "local-model"),
                         "api_type": tester_config.get("api_type", "openai"),
-                        "temperature": 0.7,
-                        "max_tokens": 4000,
+                        "temperature": tester_config.get("temperature", 0.7),
+                        "max_tokens": tester_config.get("max_tokens", 35000),
                         "timeout": tester_config.get("timeout", 600)
                     }
                 }
@@ -2341,8 +2359,8 @@ Be specific and reference actual code from the project."""
                         "model_url": doc_config.get("url", "http://localhost:1233/v1"),
                         "model_name": doc_config.get("model", "local-model"),
                         "api_type": doc_config.get("api_type", "openai"),
-                        "temperature": 0.7,
-                        "max_tokens": 3000,
+                        "temperature": doc_config.get("temperature", 0.7),
+                        "max_tokens": doc_config.get("max_tokens", 35000),
                         "timeout": doc_config.get("timeout", 600)
                     }
                 }
@@ -2380,8 +2398,8 @@ Be specific and reference actual code from the project."""
                         "model_url": sec_config.get("url", "http://localhost:1233/v1"),
                         "model_name": sec_config.get("model", "local-model"),
                         "api_type": sec_config.get("api_type", "openai"),
-                        "temperature": 0.8,
-                        "max_tokens": 3000,
+                        "temperature": sec_config.get("temperature", 0.8),
+                        "max_tokens": sec_config.get("max_tokens", 35000),
                         "timeout": sec_config.get("timeout", 600)
                     }
                 }
@@ -2414,8 +2432,8 @@ Be specific and reference actual code from the project."""
                         "model_url": opt_config.get("url", "http://localhost:1233/v1"),
                         "model_name": opt_config.get("model", "local-model"),
                         "api_type": opt_config.get("api_type", "openai"),
-                        "temperature": 0.6,
-                        "max_tokens": 4000,
+                        "temperature": opt_config.get("temperature", 0.6),
+                        "max_tokens": opt_config.get("max_tokens", 35000),
                         "timeout": opt_config.get("timeout", 600)
                     }
                 }
@@ -2486,8 +2504,8 @@ Be specific and reference actual code from the project."""
                         "model_url": ver_config.get("url", "http://localhost:1233/v1"),
                         "model_name": ver_config.get("model", "local-model"),
                         "api_type": ver_config.get("api_type", "openai"),
-                        "temperature": 0.3,
-                        "max_tokens": 3000,
+                        "temperature": ver_config.get("temperature", 0.3),
+                        "max_tokens": ver_config.get("max_tokens", 35000),
                         "timeout": ver_config.get("timeout", 600)
                     }
                 }
@@ -2537,6 +2555,45 @@ Be specific and reference actual code from the project."""
         
         return task
     
+    def _build_environment_context(self) -> str:
+        """Build a description of the runtime environment (LLM endpoints, etc.) for the coder."""
+        lines = []
+        lines.append("RUNTIME ENVIRONMENT (use this info to write real LLM integration):")
+        lines.append("-" * 60)
+
+        model_config = self.config.get("model_config", {})
+        mode = model_config.get("mode", "single")
+
+        if mode == "single":
+            sm = model_config.get("single_model", {})
+            lines.append(f"LLM Endpoint: {sm.get('url', 'http://localhost:11434')}")
+            lines.append(f"Model: {sm.get('model', 'local-model')}")
+            lines.append(f"API Type: {sm.get('api_type', 'ollama')}")
+        else:
+            # Multi-model: pick the coder's endpoint as the representative one
+            mm = model_config.get("multi_model", {})
+            coder_m = mm.get("coder", {})
+            lines.append(f"LLM Endpoint: {coder_m.get('url', 'http://localhost:1234/v1')}")
+            lines.append(f"Model: {coder_m.get('model', 'local-model')}")
+            lines.append(f"API Type: {coder_m.get('api_type', 'openai')}")
+
+        lines.append("")
+        lines.append("To call the LLM from generated code, use:")
+        lines.append("  import requests")
+        lines.append("  response = requests.post(f\"{endpoint}/chat/completions\", json={")
+        lines.append("      \"model\": model_name,")
+        lines.append("      \"messages\": [{\"role\": \"user\", \"content\": prompt}],")
+        lines.append("      \"temperature\": 0.7")
+        lines.append("  })")
+        lines.append("  result = response.json()[\"choices\"][0][\"message\"][\"content\"]")
+        lines.append("")
+        lines.append("This is a LOCAL LLM — no API key needed. Use it for any agent that")
+        lines.append("needs to analyze text, generate hypotheses, summarize papers, etc.")
+        lines.append("Do NOT mock or simulate LLM calls — actually call the endpoint above.")
+        lines.append("-" * 60)
+
+        return "\n".join(lines)
+
     def _clean_code_output(self, code: str) -> str:
         """Clean markdown formatting and explanatory text from code output"""
         
@@ -2767,8 +2824,8 @@ Be specific and reference actual code from the project."""
                 "model_url": clarifier_config.get("url", "http://localhost:1233/v1"),
                 "model_name": clarifier_config.get("model", "local-model"),
                 "api_type": clarifier_config.get("api_type", "openai"),
-                "temperature": 0.7,
-                "max_tokens": 3000,
+                "temperature": clarifier_config.get("temperature", 0.7),
+                "max_tokens": clarifier_config.get("max_tokens", 35000),
                 "timeout": clarifier_config.get("timeout", 300)
             }
         }
@@ -2780,7 +2837,7 @@ Be specific and reference actual code from the project."""
         # Log the prompt
         self._log_prompt("SYNTHESIZE", "CLARIFIER", {
             "system_prompt": "SYNTHESIZE_STRUCTURED_PROMPT" if output_format == "structured" else "SYNTHESIZE_PROMPT",
-            "user_message": f"Request: {user_request[:200]}... Q&A: {result[:200]}..."
+            "user_message": f"Request: {user_request}\n\nQ&A: {result}\n\nAnswers: {answers_text}"
         }, mode=f"synthesize_{output_format}" if output_format else "synthesize")
 
         try:
@@ -2829,7 +2886,7 @@ Be specific and reference actual code from the project."""
             return False
         
         # Find the coding task (also check build_from_plan for collaborative workflow)
-        code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution", "build_from_plan")), None)
+        code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan")), None)
         if not code_task:
             return False
 
@@ -2873,16 +2930,32 @@ Be specific and reference actual code from the project."""
             metadata=revision_metadata
         )
         revision_task.revision_count = code_task.revision_count + 1
-        
+
+        # Log the revision prompt
+        self._log_prompt(f"REVISION_{revision_task.revision_count}", "CODER", {
+            "system_prompt": "(revision system prompt)",
+            "user_message": f"Revision #{revision_task.revision_count}",
+            "revision_feedback": revision_metadata.get("revision_feedback", ""),
+            "original_code": revision_metadata.get("original_code", "")[:5000] + "..." if len(revision_metadata.get("original_code", "")) > 5000 else revision_metadata.get("original_code", ""),
+            "plan_yaml": revision_metadata.get("final_plan", "")
+        }, mode="revision")
+
         # Execute revision
         self.execute_task(revision_task)
         
         if revision_task.status == TaskStatus.COMPLETED:
+            # Log the revision result
+            self._log_prompt(f"REVISION_{revision_task.revision_count}_RESULT", "CODER", {
+                "system_prompt": "(revision result)",
+                "user_message": "RESULT",
+                "result": revision_task.result
+            }, mode="revision")
+
             # Update the context with revised code
             self._update_context(revision_task)
             self.completed_tasks.append(revision_task)
             return True
-        
+
         return False
     
     def run_workflow(self, user_request: str, workflow_type: str = "standard"):
@@ -3804,7 +3877,7 @@ OUTPUT YOUR COMPLETE REVISED CODE BELOW:
         
         # FIXED: For documenter, ensure code is included (with smart truncation)
         if task.task_type == "documentation":
-            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution")), None)
+            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan")), None)
             if code_task and code_task.result and "coding" not in str(task.dependencies):
                 # For multi-file projects, provide structure summary + key file contents
                 files_dict = self._parse_multi_file_output(code_task.result)
@@ -3858,7 +3931,7 @@ OUTPUT YOUR COMPLETE REVISED CODE BELOW:
         
         # FIXED: For security audit, ensure code is included
         if task.task_type == "security_audit":
-            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution")), None)
+            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan")), None)
             if code_task and code_task.result:
                 message_parts.append(f"\nCODE TO ANALYZE FOR SECURITY:\n{code_task.result}\n")
         
@@ -3873,7 +3946,7 @@ OUTPUT YOUR COMPLETE REVISED CODE BELOW:
         # --- FIX FOR TESTER: Provide actual source filenames ---
         # --- FIX FOR TESTER: Provide actual source code and exports ---
         if task.task_type == "test_generation":
-            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution")), None)
+            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan")), None)
             if code_task and code_task.result:
                 files_dict = self._parse_multi_file_output(code_task.result)
                 project_name = self.state["project_info"].get("project_name", "project")
@@ -3950,7 +4023,7 @@ OUTPUT YOUR COMPLETE REVISED CODE BELOW:
             message_parts.append("CRITICAL: ACTUAL FILE PATHS FOR DOCUMENTATION")
             message_parts.append("=" * 70)
             
-            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution")), None)
+            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan")), None)
             if code_task and code_task.result:
                 files_dict = self._parse_multi_file_output(code_task.result)
                 if files_dict:
@@ -3979,9 +4052,24 @@ OUTPUT YOUR COMPLETE REVISED CODE BELOW:
             "completed_at": task.completed_at
         }
     
-        # Store latest code separately
+        # Store latest code separately — merge revisions into existing code
         if task.task_type in ("coding", "revision", "plan_execution", "build_from_plan") and task.result:
-            self.state["context"]["latest_code"] = task.result
+            if task.task_type == "revision" and self.state["context"].get("latest_code"):
+                # Merge: parse both, overlay revision files onto existing
+                existing_files = self._parse_multi_file_output(self.state["context"]["latest_code"])
+                revision_files = self._parse_multi_file_output(task.result)
+                if existing_files and revision_files:
+                    existing_files.update(revision_files)
+                    # Reassemble into ### FILE: format
+                    merged_parts = []
+                    for fname, content in existing_files.items():
+                        merged_parts.append(f"### FILE: {fname} ###\n{content}")
+                    self.state["context"]["latest_code"] = "\n\n".join(merged_parts)
+                else:
+                    # Fallback: just use the revision result as-is
+                    self.state["context"]["latest_code"] = task.result
+            else:
+                self.state["context"]["latest_code"] = task.result
     
         # NEW: Store parsed plan for downstream access
         if task.task_type == "architecture_plan" and task.result:
@@ -4021,7 +4109,7 @@ OUTPUT YOUR COMPLETE REVISED CODE BELOW:
 
         # Get actual code (multi-file output string from coder/plan executor)
         code_task = next(
-            (t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution")),
+            (t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan")),
             None,
         )
         code_content = code_task.result if code_task else ""

@@ -199,6 +199,7 @@ Output ONLY the file contents. No explanations before or after."""
         """Build all code from a finalized plan."""
         plan_yaml = input_data.get("plan_yaml", "")
         job_spec = input_data.get("job_spec", "")
+        environment_context = input_data.get("environment_context", "")
 
         if not plan_yaml:
             return {"status": "error", "error": "No plan_yaml provided for build mode"}
@@ -206,6 +207,8 @@ Output ONLY the file contents. No explanations before or after."""
         user_message = f"FINALIZED PLAN:\n```yaml\n{plan_yaml}\n```"
         if job_spec:
             user_message += f"\n\nORIGINAL JOB SPECIFICATION:\n{job_spec}"
+        if environment_context:
+            user_message += f"\n\n{environment_context}"
         user_message += "\n\nBuild all files now:"
 
         messages = [
