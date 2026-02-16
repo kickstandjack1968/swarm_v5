@@ -86,24 +86,31 @@
           "timeout": 7200
         },
       "coder_2": {
-          "url": "http://localhost:11434/v1",
-          "model": "deepseek-coder-v2:16b",
-          "model_name": "Ollama deepseek-coder-v2:16b (Coder 2)",
+          "url": "http://192.168.40.100:11434/v1",
+          "model": "qwen2.5-coder:32b",
+          "model_name": "Ollama qwen2.5-coder:32b (Coder 2)",
           "api_type": "ollama",
           "timeout": 7200
         },
       "coder_3": {
-          "url": "http://localhost:11434/v1",
-          "model": "devstral:24b",
-          "model_name": "Ollama devstral:24b (Coder 3)",
+          "url": "http://192.168.40.100:11434/v1",
+          "model": "wizardcoder:33b",
+          "model_name": "Ollama wizardcoder:33b (Coder 3)",
           "api_type": "ollama",
           "timeout": 7200
         },
       "coder_4": {
-          "url": "http://localhost:1234/v1",
-          "model": "qwen2.5-coder-32b-instruct@q8_0",
-          "model_name": "LM Studio qwen2.5-coder-32b-instruct q8 (Coder 4)",
-          "api_type": "openai",
+          "url": "http://192.168.40.100:11434/v1",
+          "model": "codellama:34b",
+          "model_name": "Ollama codellama:34b (Coder 4)",
+          "api_type": "ollama",
+          "timeout": 7200
+        },
+      "coder_5": {
+          "url": "http://192.168.40.100:11434/v1",
+          "model": "deepseek-r1:32b",
+          "model_name": "Ollama deepseek-r1:32b (Coder 5 - R1 Reasoning)",
+          "api_type": "ollama",
           "timeout": 7200
         },
       "arbitrator": {
@@ -147,6 +154,11 @@
       "temperature": 0.3,
       "max_tokens": 35000,
       "top_p": 0.85
+    },
+    "coder_5": {
+      "temperature": 0.4,
+      "max_tokens": 35000,
+      "top_p": 0.9
     },
     "clarifier": {
       "temperature": 0.7,
