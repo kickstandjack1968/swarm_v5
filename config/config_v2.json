@@ -9,84 +9,84 @@
     },
     "multi_model": {
       "architect": {
-        "url": "http://192.168.40.100:1234/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "Lm Studio qwen/qwen3-coder-30b (Architect)",
         "api_type": "openai",
         "timeout": 7200
       },
       "clarifier": {
-        "url": "http://192.168.40.100:1234/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "LM Studio qwen/qwen3-coder-30b (Clarifier)",
         "api_type": "openai",
         "timeout": 7200
       },
       "coder": {
-        "url": "http://192.168.40.100:1234/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "LM Studio qwen/qwen3-coder-30b (Coder)",
         "api_type": "openai",
         "timeout": 7200
       },
       "verifier": {
-        "url": "http://192.168.40.100:1234/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "LM Studio qwen/qwen3-coder-30b (Verifier)",
         "api_type": "openai",
         "timeout": 7200
       },
       "reviewer": {
-        "url": "http://192.168.40.100:1234/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "LM Studio qwen/qwen3-coder-30b (Reviewer)",
         "api_type": "openai",
         "timeout": 7200
       },
       "tester": {
-        "url": "http://192.168.40.100:1234/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "LM Studio qwen/qwen3-coder-30b (Tester)",
         "api_type": "openai",
         "timeout": 7200
       },
       "optimizer": {
-        "url": "http://192.168.40.100:1234/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "LM Studio qwen/qwen3-coder-30b (Optimizer)",
         "api_type": "openai",
         "timeout": 7200
       },
       "documenter": {
-        "url": "http://192.168.40.100:1234/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "LM Studio qwen/qwen3-coder-30b (Documenter)",
         "api_type": "openai",
         "timeout": 7200
       },
       "debugger": {
-        "url": "http://192.168.40.100:1234/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "LM Studio qwen/qwen3-coder-30b (Debugger)",
         "api_type": "openai",
         "timeout": 7200
       },
       "security": {
-        "url": "http://192.168.40.100:1234/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
         "model_name": "LM Studio qwen/qwen3-coder-30b (Security)",
         "api_type": "openai",
         "timeout": 7200
       },
       "fallback_coder": {
-          "url": "http://192.168.40.100:1234/v1",
+          "url": "http://localhost:1234/v1",
           "model": "qwen/qwen3-coder-30b",
           "model_name": "LM Studio qwen/qwen3-coder-30b (Fallback Coder)",
           "api_type": "openai",
           "timeout": 7200
         },
       "arbitrator": {
-        "url": "http://192.168.40.100:1234/v1",
+        "url": "http://localhost:1234/v1",
         "model": "qwen2.5-coder-7b-instruct",
         "model_name": "qwen2.5-coder-7b-instruct (Arbitrator)",
         "api_type": "openai",
@@ -97,58 +97,58 @@
   "agent_parameters": {
     "architect": {
       "temperature": 0.5,
-      "max_tokens": 35000,
+      "max_tokens": 25000,
       "top_p": 0.85
     },    
     "fallback_coder": {
       "temperature": 0.7,
-      "max_tokens": 35000,
+      "max_tokens": 25000,
       "top_p": 0.85
     },
     "clarifier": {
       "temperature": 0.7,
-      "max_tokens": 35000,
+      "max_tokens": 25000,
       "top_p": 0.9
     },
     "coder": {
       "temperature": 0.2,
-      "max_tokens": 35000,
+      "max_tokens": 25000,
       "top_p": 0.85
     },
     "reviewer": {
       "temperature": 0.8,
-      "max_tokens": 35000,
+      "max_tokens": 25000,
       "top_p": 0.95,
       "adversarial_mode": true
     },
     "tester": {
       "temperature": 0.7,
-      "max_tokens": 35000,
+      "max_tokens": 25000,
       "top_p": 0.9
     },
     "optimizer": {
       "temperature": 0.6,
-      "max_tokens": 35000,
+      "max_tokens": 25000,
       "top_p": 0.85
     },
     "verifier": {
       "temperature": 0.3,
-      "max_tokens": 35000,
+      "max_tokens": 25000,
       "top_p": 0.85
     },
     "documenter": {
       "temperature": 0.7,
-      "max_tokens": 35000,
+      "max_tokens": 25000,
       "top_p": 0.9
     },
     "debugger": {
       "temperature": 0.6,
-      "max_tokens": 35000,
+      "max_tokens": 25000,
       "top_p": 0.85
     },
     "security": {
       "temperature": 0.8,
-      "max_tokens": 35000,
+      "max_tokens": 25000,
       "top_p": 0.95
     },
     "arbitrator": {

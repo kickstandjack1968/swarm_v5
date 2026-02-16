@@ -20,7 +20,6 @@ FIXES APPLIED:
 - Added user_request to all downstream contexts
 """
 
-import ast
 import json
 import os
 import time
@@ -34,21 +33,17 @@ from threading import Lock
 import re
 import subprocess
 import sys
-import yaml
 
 
 # Plan Executor integration
 try:
     from plan_executor_v2 import (
-        PlanExecutor,
+        PlanExecutor, 
         create_planned_workflow,
         execute_plan_task,
         ARCHITECT_PLAN_SYSTEM_PROMPT,
         get_architect_plan_prompt,
-        extract_yaml_from_response,
-        FileSpec,
-        FileResult,
-        FileStatus
+        extract_yaml_from_response
     )
     PLAN_EXECUTOR_AVAILABLE = True
 except ImportError as e:
@@ -400,10 +395,6 @@ class AgentRole(Enum):
     SECURITY = "security"
     VERIFIER = "verifier"
     FALLBACK_CODER= "fallback_coder"
-    CODER_2 = "coder_2"
-    CODER_3 = "coder_3"
-    CODER_4 = "coder_4"
-    TOOLSMITH = "toolsmith"
 
 
 class TaskStatus(Enum):
@@ -496,11 +487,7 @@ class AgentExecutor:
                 AgentRole.DOCUMENTER: 'documenter',
                 AgentRole.DEBUGGER: 'debugger',
                 AgentRole.SECURITY: 'security',
-                AgentRole.VERIFIER: 'verifier',
-                AgentRole.CODER_2: 'coder_2',
-                AgentRole.CODER_3: 'coder_3',
-                AgentRole.CODER_4: 'coder_4',
-                AgentRole.TOOLSMITH: 'toolsmith'
+                AgentRole.VERIFIER: 'verifier'
             }
             fallback_role = fallback_map.get(role, 'coder')
             if fallback_role in self.config['model_config']['multi_model']:
@@ -728,16 +715,16 @@ class SwarmCoordinator:
                 }
             },
             "agent_parameters": {
-                "architect": {"temperature": 0.5, "max_tokens": 35000, "top_p": 0.85},
-                "clarifier": {"temperature": 0.7, "max_tokens": 35000, "top_p": 0.9},
-                "coder": {"temperature": 0.2, "max_tokens": 35000, "top_p": 0.85},
-                "reviewer": {"temperature": 0.8, "max_tokens": 35000, "top_p": 0.95},
-                "tester": {"temperature": 0.7, "max_tokens": 35000, "top_p": 0.9},
-                "optimizer": {"temperature": 0.6, "max_tokens": 35000, "top_p": 0.85},
-                "documenter": {"temperature": 0.7, "max_tokens": 35000, "top_p": 0.9},
-                "debugger": {"temperature": 0.6, "max_tokens": 35000, "top_p": 0.85},
-                "security": {"temperature": 0.8, "max_tokens": 35000, "top_p": 0.95},
-                "verifier": {"temperature": 0.3, "max_tokens": 35000, "top_p": 0.85}
+                "architect": {"temperature": 0.6, "max_tokens": 3000},
+                "clarifier": {"temperature": 0.7, "max_tokens": 2000},
+                "coder": {"temperature": 0.2, "max_tokens": 6000},
+                "reviewer": {"temperature": 0.8, "max_tokens": 3000},
+                "tester": {"temperature": 0.7, "max_tokens": 4000},
+                "optimizer": {"temperature": 0.6, "max_tokens": 4000},
+                "documenter": {"temperature": 0.7, "max_tokens": 3000},
+                "debugger": {"temperature": 0.6, "max_tokens": 4000},
+                "security": {"temperature": 0.8, "max_tokens": 3000},
+                "verifier": {"temperature": 0.3, "max_tokens": 3000}
             },
             "workflow": {
                 "max_iterations": 3,
@@ -766,13 +753,23 @@ class SwarmCoordinator:
                     if parent:
                         folders_with_py.add(parent)
         
-        # Generate empty __init__.py for each (PlanExecutor creates proper ones with
-        # explicit named imports — we just ensure the file exists for packages that need it)
+        # Generate __init__.py for each
         for folder in folders_with_py:
             init_path = os.path.join(folder, "__init__.py")
             if not os.path.exists(init_path):
+                # Simple __init__.py with exports
+                py_files = [f for f in os.listdir(folder) 
+                           if f.endswith('.py') and f != '__init__.py']
+                
+                lines = ['"""Auto-generated __init__.py"""', '']
+                
+                # Import from each module
+                for py_file in py_files:
+                    module = py_file[:-3]  # Remove .py
+                    lines.append(f"from .{module} import *")
+                
                 with open(init_path, 'w') as f:
-                    f.write('"""Auto-generated __init__.py"""\n')
+                    f.write('\n'.join(lines))
                 
                 print(f"   ✓ Generated: {os.path.relpath(init_path, project_dir)}")
 
@@ -965,59 +962,51 @@ PROJECT STRUCTURE
         if not project_dir:
             return
         
-        # Save code - merge all code-producing tasks (build + revisions)
-        # Earlier tasks provide the baseline, later revisions override specific files
-        code_tasks = [t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan") and t.result]
-        files_dict = {}
-        for code_task in code_tasks:
-            parsed = self._parse_multi_file_output(code_task.result)
-            if parsed:
-                files_dict.update(parsed)  # Later tasks override earlier ones
+        # Save code - handle multi-file output
+        code_task = next((t for t in reversed(self.completed_tasks) if t.task_type in ("coding", "plan_execution", "revision")), None)
+        if code_task and code_task.result:
+            files_dict = self._parse_multi_file_output(code_task.result)
+            
+            if files_dict:
+                # Multi-file output detected
+                for filename, content in files_dict.items():
+                    # Normalize path separators
+                    filename = filename.replace('\\', '/')
+                    
+                    # INTELLIGENT ROUTING
+                    if filename.startswith("src/"):
+                        # Explicitly marked for src -> Strip prefix, go to src/
+                        rel_path = filename[len("src/"):]
+                        base_dir = os.path.join(project_dir, "src")
+                    elif filename.startswith("tests/"):
+                        # Explicitly marked for tests -> Go to root/tests
+                        rel_path = filename 
+                        base_dir = project_dir 
+                    elif filename.startswith("docs/"):
+                        # Explicitly marked for docs -> Go to root/docs
+                        rel_path = filename
+                        base_dir = project_dir
+                    else:
+                        # Implicit source file -> Go to src/ (SAFE DEFAULT)
+                        rel_path = filename
+                        base_dir = os.path.join(project_dir, "src")
 
-        if not files_dict and code_tasks:
-            # Single file output fallback — use last task
-            code_task = code_tasks[-1]
+                    code_file = os.path.join(base_dir, rel_path)
+                    
+                    # Ensure directory exists
+                    os.makedirs(os.path.dirname(code_file), exist_ok=True)
+                    
+                    with open(code_file, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                print(f"   ✓ Created {len(files_dict)} files (smart routed)")
 
-        if files_dict:
-            # Multi-file output detected
-            for filename, content in files_dict.items():
-                # Normalize path separators
-                filename = filename.replace('\\', '/')
-
-                # INTELLIGENT ROUTING
-                if filename.startswith("src/"):
-                    # Explicitly marked for src -> Strip prefix, go to src/
-                    rel_path = filename[len("src/"):]
-                    base_dir = os.path.join(project_dir, "src")
-                elif filename.startswith("tests/"):
-                    # Explicitly marked for tests -> Go to root/tests
-                    rel_path = filename
-                    base_dir = project_dir
-                elif filename.startswith("docs/"):
-                    # Explicitly marked for docs -> Go to root/docs
-                    rel_path = filename
-                    base_dir = project_dir
-                else:
-                    # Implicit source file -> Go to src/ (SAFE DEFAULT)
-                    rel_path = filename
-                    base_dir = os.path.join(project_dir, "src")
-
-                code_file = os.path.join(base_dir, rel_path)
-
-                # Ensure directory exists
-                os.makedirs(os.path.dirname(code_file), exist_ok=True)
-
+            else:
+                # Single file output (legacy behavior) - assume source
+                project_name = self.state["project_info"]["project_name"]
+                code_file = os.path.join(project_dir, "src", f"{project_name}.py")
+                
                 with open(code_file, 'w', encoding='utf-8') as f:
-                    f.write(content)
-            print(f"   ✓ Created {len(files_dict)} files (smart routed)")
-
-        elif code_tasks:
-            # Single file output (legacy behavior) - assume source
-            project_name = self.state["project_info"]["project_name"]
-            code_file = os.path.join(project_dir, "src", f"{project_name}.py")
-
-            with open(code_file, 'w', encoding='utf-8') as f:
-                f.write(code_tasks[-1].result)
+                    f.write(code_task.result)
         self._generate_init_files(project_dir)
 
 
@@ -1204,46 +1193,6 @@ PROJECT STRUCTURE
         return files
 
 
-    def _build_file_plan_spec_string(self, file_spec) -> str:
-        """Convert a FileSpec to a human-readable string for the reviewer."""
-        parts = [f"File: {file_spec.name}"]
-        parts.append(f"Purpose: {file_spec.purpose}")
-
-        if file_spec.exports:
-            parts.append("Required exports:")
-            for exp in file_spec.exports:
-                methods_str = ""
-                if exp.methods:
-                    method_names = list(exp.methods.keys())
-                    methods_str = f" (methods: {', '.join(method_names)})"
-                parts.append(f"  - {exp.name} ({exp.type}){methods_str}")
-
-        if file_spec.requirements:
-            parts.append("Requirements:")
-            for req in file_spec.requirements:
-                parts.append(f"  - {req}")
-
-        if file_spec.imports_from:
-            parts.append("Imports from:")
-            for src, names in file_spec.imports_from.items():
-                parts.append(f"  - {src}: {', '.join(names)}")
-
-        return "\n".join(parts)
-
-    def _build_dependency_code_for_review(self, file_spec, all_files_dict: dict) -> str:
-        """Build dependency context for per-file review.
-
-        Direct deps get full code (8K cap each), other files get signatures only.
-        """
-        parts = []
-        for dep_name in file_spec.dependencies:
-            dep_code = all_files_dict.get(dep_name, "")
-            if dep_code:
-                if len(dep_code) > 8000:
-                    dep_code = dep_code[:8000] + "\n# ... (truncated)"
-                parts.append(f"### {dep_name} ###\n{dep_code}")
-        return "\n\n".join(parts)
-
     def _extract_exports_from_code(self, code: str) -> List[str]:
         """Extract public function and class names from Python code"""
         exports = []
@@ -1384,81 +1333,7 @@ PROJECT STRUCTURE
         
         return len(issues) == 0, issues
 
-    def _check_imports_against_plan(self, code_output: str, plan_yaml: str) -> List[str]:
-        """Check that imports in generated code match the plan's imports_from specs."""
-        errors = []
-        try:
-            plan = yaml.safe_load(plan_yaml) if isinstance(plan_yaml, str) else plan_yaml
-        except Exception:
-            return errors
-
-        if not isinstance(plan, dict):
-            return errors
-
-        # Build map: filename -> {source_file: [names]}
-        plan_imports = {}
-        for file_spec in plan.get('files', []):
-            fname = file_spec.get('name', '')
-            imports_from = file_spec.get('imports_from', {})
-            if imports_from:
-                plan_imports[fname] = imports_from
-
-        if not plan_imports:
-            return errors
-
-        # Parse coder output into files
-        actual_files = self._parse_multi_file_output(code_output)
-        if not actual_files:
-            return errors
-
-        # Build set of all plan filenames for resolution
-        all_plan_files = {f.get('name', '') for f in plan.get('files', [])}
-
-        for filename, expected_imports in plan_imports.items():
-            if filename not in actual_files:
-                continue
-
-            content = actual_files[filename]
-            try:
-                tree = ast.parse(content)
-            except SyntaxError:
-                continue
-
-            # Build set of modules actually imported
-            actual_import_modules = set()
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom) and node.module:
-                    actual_import_modules.add(node.module.lstrip('.'))
-
-            # Check each expected import source is referenced
-            for source_file, names in expected_imports.items():
-                source_module = source_file.replace('.py', '').replace('/', '.')
-                source_base = source_file.replace('.py', '').split('/')[-1]
-
-                found = any(
-                    m == source_module or m == source_base or m.endswith('.' + source_base)
-                    for m in actual_import_modules
-                )
-                if not found:
-                    errors.append(
-                        f"{filename}: plan requires importing {names} from "
-                        f"'{source_file}', but no matching import found"
-                    )
-
-            # Check for relative imports that go beyond project root
-            file_parts = filename.replace('\\', '/').split('/')
-            file_depth = len(file_parts) - 1
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom) and node.level and node.level > 0:
-                    if node.level > file_depth + 1:
-                        errors.append(
-                            f"{filename}: 'from {'.' * node.level}{node.module or ''}' "
-                            f"goes {node.level} levels up but file is only "
-                            f"{file_depth} level(s) deep"
-                        )
-
-        return errors
-
+    
     def _extract_expected_files(self, architect_result: str) -> set:
         """Extract expected file names from architect's design"""
         files = set()
@@ -1504,7 +1379,7 @@ PROJECT STRUCTURE
     
     def _create_requirements_txt(self, project_dir: str):
         """Generate requirements.txt with PINNED GOLDEN STACK versions."""
-        code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan")), None)
+        code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution")), None)
         if not code_task or not code_task.result:
             return
         
@@ -1626,9 +1501,7 @@ PROJECT STRUCTURE
         os.makedirs(log_dir, exist_ok=True)
 
         timestamp = datetime.now().strftime("%H%M%S")
-        # Sanitize step name: replace / with _ to avoid creating subdirectories
-        safe_step = step.replace("/", "_")
-        filename = f"{timestamp}_{agent_name}_{safe_step}.json"
+        filename = f"{timestamp}_{agent_name}_{step}.json"
 
         log_entry = {
             "step": step,
@@ -1639,8 +1512,7 @@ PROJECT STRUCTURE
             "user_message": payload.get("user_message", ""),
         }
         # Include any extra keys from payload (job_spec, plan_yaml, etc.)
-        for key in ("job_spec", "plan_yaml", "plan_spec", "code", "draft_plan", "coder_feedback",
-                     "environment_context", "revision_feedback", "original_code", "result"):
+        for key in ("job_spec", "plan_yaml", "code", "draft_plan", "coder_feedback"):
             if key in payload:
                 log_entry[key] = payload[key]
 
@@ -1717,49 +1589,29 @@ PROJECT STRUCTURE
         # ---------------------------------------------------------------------
         if self.sandbox and self.sandbox.enabled and self.sandbox.container_running:
             print("   🐳 Running verification in Docker sandbox...")
-
-            # 1. Sync files to container (recursive for subdirectories)
+            
+            # 1. Sync files to container
+            # We copy the whole project dir to /workspace
+            # Note: simplistic copy; for huge projects rsync is better, but this works for agents.
             src_local = os.path.join(project_dir, "src")
             tests_local = os.path.join(project_dir, "tests")
-
+            
             # Create remote dirs
             self.sandbox._exec(["mkdir", "-p", "/workspace/src", "/workspace/tests"])
-
-            # Copy src files (recursive — handles subdirectories like src/agents/)
+            
+            # Copy src files
             if os.path.exists(src_local):
-                for root, dirs, files in os.walk(src_local):
-                    rel_root = os.path.relpath(root, src_local)
-                    remote_root = f"/workspace/src/{rel_root}" if rel_root != "." else "/workspace/src"
-                    if rel_root != ".":
-                        self.sandbox._exec(["mkdir", "-p", remote_root])
-                    for f in files:
-                        if f.endswith(".py"):
-                            self.sandbox.copy_to_container(os.path.join(root, f), f"{remote_root}/{f}")
-
+                for f in os.listdir(src_local):
+                    if f.endswith(".py"):
+                        self.sandbox.copy_to_container(os.path.join(src_local, f), f"/workspace/src/{f}")
+            
             # Copy test files
             if os.path.exists(tests_local):
                 for f in os.listdir(tests_local):
                     if f.endswith(".py"):
                         self.sandbox.copy_to_container(os.path.join(tests_local, f), f"/workspace/tests/{f}")
 
-            # 2. Install requirements.txt if present
-            req_file = os.path.join(project_dir, "requirements.txt")
-            if os.path.exists(req_file):
-                self.sandbox.copy_to_container(req_file, "/workspace/requirements.txt")
-                print("   📦 Installing project dependencies...")
-                install_res = self.sandbox._exec(
-                    ["pip", "install", "-q", "--no-cache-dir", "-r", "/workspace/requirements.txt"],
-                    timeout=120
-                )
-                if install_res.returncode != 0:
-                    print(f"   ⚠ Some deps failed to install (rc={install_res.returncode})")
-                    if install_res.stderr:
-                        # Show last few lines of error
-                        err_lines = install_res.stderr.strip().split("\n")
-                        for line in err_lines[-5:]:
-                            print(f"      {line}")
-
-            # 3. Run Pytest in Docker
+            # 2. Run Pytest in Docker
             # We use the sandbox's internal run_pytest or raw _exec
             code, output = self.sandbox.run_pytest("/workspace/tests")
             # Parse the output into a result dict format similar to local
@@ -1794,24 +1646,12 @@ PROJECT STRUCTURE
         # PATH B: LOCAL FALLBACK (Original Logic)
         # ---------------------------------------------------------------------
         print("   ⚠ Docker unavailable/disabled. Running verification locally.")
-
+        
         # Setup Environment
         env = os.environ.copy()
         src_dir = os.path.join(project_dir, "src")
         env["PYTHONPATH"] = f"{project_dir}{os.pathsep}{src_dir}{os.pathsep}{env.get('PYTHONPATH','')}"
-
-        # Install requirements.txt if present
-        req_file = os.path.join(project_dir, "requirements.txt")
-        if os.path.exists(req_file):
-            print("   📦 Installing project dependencies...")
-            try:
-                subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "-r", req_file],
-                    env=env, capture_output=True, text=True, timeout=120
-                )
-            except Exception as e:
-                print(f"   ⚠ Dependency install failed: {e}")
-
+        
         # Run Pytest
         try:
             res = subprocess.run(
@@ -1861,27 +1701,12 @@ PROJECT STRUCTURE
         try:
 # --- PRIORITY 0: PLAN EXECUTION ---
             if task.task_type == "plan_execution":
-                plan_yaml = (
-                    self.state["context"].get("final_plan") or
-                    self.state["context"].get("architecture_plan") or
-                    self.state["context"].get("plan_yaml") or
-                    ""
-                )
+                plan_yaml = self.state["context"].get("plan_yaml", "")
                 if not plan_yaml: raise Exception("No YAML plan found")
-                job_scope = self.state["context"].get("job_spec") or self.state["context"].get("job_scope", "")
-                task.result = execute_plan_task(self, task, plan_yaml, task.metadata.get("user_request",""), job_scope)
-                self.state["context"]["inline_reviewer_done"] = True
+                task.result = execute_plan_task(self, task, plan_yaml, task.metadata.get("user_request",""), self.state["context"].get("job_scope", ""))
                 task.status = TaskStatus.COMPLETED
                 task.completed_at = time.time()
                 self._update_context(task)
-                # Save files immediately so they're on disk even if later steps fail
-                # Temporarily add task to completed_tasks so _save_project_outputs can find it
-                self.completed_tasks.append(task)
-                try:
-                    self._save_project_outputs()
-                except Exception as e:
-                    print(f"  ⚠ Error saving after plan_execution: {e}")
-                self.completed_tasks.remove(task)
                 return task
             
             # --- COLLABORATIVE WORKFLOW TASK HANDLERS ---
@@ -1900,8 +1725,8 @@ PROJECT STRUCTURE
                         "model_url": architect_config.get("url", "http://localhost:1233/v1"),
                         "model_name": architect_config.get("model", "local-model"),
                         "api_type": architect_config.get("api_type", "openai"),
-                        "temperature": architect_config.get("temperature", 0.6),
-                        "max_tokens": architect_config.get("max_tokens", 35000),
+                        "temperature": 0.6,
+                        "max_tokens": 4000,
                         "timeout": architect_config.get("timeout", 600)
                     }
                 }
@@ -1938,8 +1763,8 @@ PROJECT STRUCTURE
                         "model_url": coder_config.get("url", "http://localhost:1233/v1"),
                         "model_name": coder_config.get("model", "local-model"),
                         "api_type": coder_config.get("api_type", "openai"),
-                        "temperature": coder_config.get("temperature", 0.3),
-                        "max_tokens": coder_config.get("max_tokens", 35000),
+                        "temperature": 0.3,
+                        "max_tokens": 4000,
                         "timeout": coder_config.get("timeout", 1200)
                     }
                 }
@@ -1978,8 +1803,8 @@ PROJECT STRUCTURE
                         "model_url": architect_config.get("url", "http://localhost:1233/v1"),
                         "model_name": architect_config.get("model", "local-model"),
                         "api_type": architect_config.get("api_type", "openai"),
-                        "temperature": architect_config.get("temperature", 0.6),
-                        "max_tokens": architect_config.get("max_tokens", 35000),
+                        "temperature": 0.6,
+                        "max_tokens": 4000,
                         "timeout": architect_config.get("timeout", 600)
                     }
                 }
@@ -2006,83 +1831,27 @@ PROJECT STRUCTURE
                 self._update_context(task)
                 return task
 
-            # TOOL_CHECK: Toolsmith checks Tool Forge for reusable tools before coding
-            if task.task_type == "tool_check":
-                user_request = self.state["context"].get("user_request", "")
-                job_scope = self.state["context"].get("job_spec") or self.state["context"].get("job_scope", "")
-                architecture = self.state["context"].get("final_plan") or self.state["context"].get("draft_plan", "")
-                toolsmith_config = self.executor._get_agent_config(AgentRole.TOOLSMITH)
-
-                payload = {
-                    "task_description": job_scope or user_request,
-                    "user_request": user_request,
-                    "architecture_plan": architecture,
-                    "config": {
-                        "model_url": toolsmith_config.get("url", "http://192.168.40.100:1234/v1"),
-                        "model_name": toolsmith_config.get("model", "qwen/qwen3-coder-30b"),
-                        "api_type": toolsmith_config.get("api_type", "openai"),
-                        "temperature": toolsmith_config.get("temperature", 0.3),
-                        "max_tokens": toolsmith_config.get("max_tokens", 4000),
-                        "timeout": toolsmith_config.get("timeout", 300)
-                    }
-                }
-
-                self._log_prompt("TOOL_CHECK", "TOOLSMITH", payload, mode="tool_check")
-
-                try:
-                    output = self._run_external_agent("toolsmith", payload)
-                    if output.get("status") == "error":
-                        raise Exception(output.get("error"))
-
-                    decision = output.get("decision", "skip")
-                    tool_context = output.get("tool_context", "")
-                    self.state["context"]["tool_context"] = tool_context
-                    self.state["context"]["tool_decision"] = decision
-                    task.result = f"Decision: {decision}\n{tool_context}"
-                    task.status = TaskStatus.COMPLETED
-                    print(f"  ✓ Tool check: {decision}" +
-                          (f" ({len(output.get('reuse_tools', []))} reuse, {len(output.get('built_tools', []))} built)" if decision != "skip" else ""))
-                except Exception as e:
-                    # Tool check failure is non-fatal - skip and continue
-                    print(f"  ⚠ Tool check failed: {e} — continuing without tools")
-                    self.state["context"]["tool_context"] = ""
-                    self.state["context"]["tool_decision"] = "skip"
-                    task.result = "Tool check skipped due to error"
-                    task.status = TaskStatus.COMPLETED
-
-                task.completed_at = time.time()
-                self._update_context(task)
-                return task
-
             # BUILD_FROM_PLAN: Coder builds all code (owns imports — no _fix_relative_imports)
             if task.task_type == "build_from_plan":
                 final_plan = self.state["context"].get("final_plan", "")
                 job_spec = self.state["context"].get("job_spec", self.state["context"].get("job_scope", ""))
                 coder_config = self.executor._get_agent_config(AgentRole.CODER)
 
-                # Build environment context so coder knows how to reach LLMs
-                env_context = self._build_environment_context()
-
-                # Inject tool context from toolsmith if available
-                tool_context = self.state["context"].get("tool_context", "")
-
                 payload = {
                     "mode": "build",
                     "plan_yaml": final_plan,
                     "job_spec": job_spec,
-                    "environment_context": env_context,
-                    "tool_context": tool_context,
                     "config": {
                         "model_url": coder_config.get("url", "http://localhost:1233/v1"),
                         "model_name": coder_config.get("model", "local-model"),
                         "api_type": coder_config.get("api_type", "openai"),
-                        "temperature": coder_config.get("temperature", 0.2),
-                        "max_tokens": coder_config.get("max_tokens", 35000),
+                        "temperature": 0.2,
+                        "max_tokens": coder_config.get("max_tokens", 25000),
                         "timeout": coder_config.get("timeout", 1200)
                     }
                 }
 
-                self._log_prompt("BUILD", "CODER", {"system_prompt": "BUILD_PROMPT", "user_message": f"PLAN:\n{final_plan}\n\nJOB_SPEC:\n{job_spec}\n\nENV:\n{env_context}\n\nTOOL_CONTEXT:\n{tool_context}", "plan_yaml": final_plan, "job_spec": job_spec, "environment_context": env_context, "tool_context": tool_context}, mode="build")
+                self._log_prompt("BUILD", "CODER", {"system_prompt": "BUILD_PROMPT", "user_message": final_plan, "plan_yaml": final_plan, "job_spec": job_spec}, mode="build")
 
                 try:
                     output = self._run_external_agent("coder", payload)
@@ -2092,28 +1861,7 @@ PROJECT STRUCTURE
                     result_text = output.get("result", "")
                     result_text = self._clean_code_output(result_text)
 
-                    # Validate imports against plan before accepting
-                    import_errors = self._check_imports_against_plan(result_text, final_plan)
-                    if import_errors:
-                        print(f"  ⚠ Import violations found ({len(import_errors)}), requesting fix...")
-                        fix_prompt = (
-                            "The following import errors were found in your code:\n"
-                            + "\n".join(f"  - {e}" for e in import_errors)
-                            + "\n\nFix ONLY the import statements to match the plan's imports_from section. "
-                            "Output ALL files again with corrected imports."
-                        )
-                        fix_payload = dict(payload)
-                        fix_payload["job_spec"] = fix_prompt + "\n\nOriginal plan:\n" + final_plan
-                        try:
-                            fix_output = self._run_external_agent("coder", fix_payload)
-                            if fix_output.get("status") != "error":
-                                fixed_text = self._clean_code_output(fix_output.get("result", ""))
-                                if fixed_text:
-                                    result_text = fixed_text
-                                    print(f"  ✓ Imports fixed ({len(result_text)} chars)")
-                        except Exception as fix_err:
-                            print(f"  ⚠ Import fix pass failed: {fix_err}")
-
+                    # NOTE: We do NOT call _fix_relative_imports — the coder owns imports
                     self.state["context"]["latest_code"] = result_text
                     task.result = result_text
                     task.status = TaskStatus.COMPLETED
@@ -2126,200 +1874,43 @@ PROJECT STRUCTURE
                 self._update_context(task)
                 return task
 
-            # COMPLIANCE_REVIEW: Reviewer checks code against plan (file-by-file)
+            # COMPLIANCE_REVIEW: Reviewer checks code against plan
             if task.task_type == "compliance_review":
                 final_plan = self.state["context"].get("final_plan", "")
                 latest_code = self.state["context"].get("latest_code", "")
-                job_spec = self.state["context"].get("job_spec", self.state["context"].get("job_scope", ""))
                 reviewer_config = self.executor._get_agent_config(AgentRole.REVIEWER)
 
-                reviewer_llm_config = {
-                    "model_url": reviewer_config.get("url", "http://localhost:1233/v1"),
-                    "model_name": reviewer_config.get("model", "local-model"),
-                    "api_type": reviewer_config.get("api_type", "openai"),
-                    "temperature": reviewer_config.get("temperature", 0.3),
-                    "max_tokens": reviewer_config.get("max_tokens", 8000),
-                    "timeout": reviewer_config.get("timeout", 600)
+                payload = {
+                    "mode": "compliance",
+                    "plan_yaml": final_plan,
+                    "code": latest_code,
+                    "config": {
+                        "model_url": reviewer_config.get("url", "http://localhost:1233/v1"),
+                        "model_name": reviewer_config.get("model", "local-model"),
+                        "api_type": reviewer_config.get("api_type", "openai"),
+                        "temperature": 0.3,
+                        "max_tokens": 4000,
+                        "timeout": reviewer_config.get("timeout", 600)
+                    }
                 }
 
-                # Try file-by-file compliance review
-                use_file_by_file = False
-                plan_parsed = None
-                all_files_dict = self._parse_multi_file_output(latest_code) if latest_code else {}
-
-                if PLAN_EXECUTOR_AVAILABLE and final_plan and all_files_dict:
-                    try:
-                        plan_exec = PlanExecutor(executor=self.executor, config=self.config)
-                        plan_parsed = plan_exec.parse_plan(final_plan)
-                        use_file_by_file = True
-                    except Exception as e:
-                        print(f"  ⚠ Could not parse plan for file-by-file review: {e}")
+                self._log_prompt("COMPLIANCE", "REVIEWER", {"system_prompt": "COMPLIANCE_PROMPT", "user_message": "(plan+code)", "plan_yaml": final_plan, "code": latest_code[:2000]}, mode="compliance")
 
                 try:
-                    if use_file_by_file and plan_parsed:
-                        # Check if inline reviewer already ran during build
-                        if self.state["context"].get("inline_reviewer_done"):
-                            print(f"  ✓ Inline reviewer already ran during build — skipping batch review")
-                            per_file_results = {}
-                            failed_files = []
-                            report_parts = ["COMPLIANCE REVIEW (inline during build):\n"]
-                            for file_spec in plan_parsed.files:
-                                fname = file_spec.name
-                                if fname in all_files_dict:
-                                    per_file_results[fname] = f"FILE: {fname}\nSTATUS: PASS\n(Passed inline reviewer during build)"
-                                    report_parts.append(per_file_results[fname])
-                                else:
-                                    per_file_results[fname] = "MISSING"
-                                    failed_files.append(fname)
-                                    report_parts.append(f"FILE: {fname}\nSTATUS: FAIL\nFile missing.\n")
+                    output = self._run_external_agent("reviewer", payload)
+                    if output.get("status") == "error":
+                        raise Exception(output.get("error"))
 
-                            if failed_files:
-                                report_parts.append(f"\nOVERALL: STATUS: NEEDS_REVISION")
-                                report_parts.append(f"Failed files: {', '.join(failed_files)}")
-                            else:
-                                report_parts.append(f"\nOVERALL: STATUS: APPROVED")
+                    result_text = output.get("result", "")
+                    task.result = result_text
 
-                            result_text = "\n".join(report_parts)
-                            task.result = result_text
-                            task.metadata["per_file_results"] = per_file_results
-                            task.metadata["failed_files"] = failed_files
-                            if failed_files:
-                                task.metadata["needs_revision"] = True
-                                task.metadata["final_plan"] = final_plan
-                            task.status = TaskStatus.COMPLETED
-                            task.completed_at = time.time()
-                            self._update_context(task)
-                            return task
-
-                        # No inline review — do batch file-by-file compliance review
-                        print(f"  📋 File-by-file compliance review ({len(plan_parsed.files)} files)")
-                        per_file_results = {}
-                        failed_files = []
-                        report_parts = ["COMPLIANCE REVIEW (file-by-file):\n"]
-
-                        for file_spec in plan_parsed.files:
-                            fname = file_spec.name
-                            file_code = all_files_dict.get(fname, "")
-
-                            if not file_code:
-                                # File is in plan but missing from code
-                                per_file_results[fname] = "MISSING — file not found in generated code"
-                                failed_files.append(fname)
-                                report_parts.append(f"FILE: {fname}\nSTATUS: FAIL\nFile missing from generated code.\n")
-                                print(f"    ✗ {fname}: MISSING")
-                                continue
-
-                            plan_spec_str = self._build_file_plan_spec_string(file_spec)
-                            dep_code_str = self._build_dependency_code_for_review(file_spec, all_files_dict)
-
-                            payload = {
-                                "mode": "compliance_file",
-                                "file_name": fname,
-                                "file_code": file_code,
-                                "plan_spec": plan_spec_str,
-                                "dependency_code": dep_code_str,
-                                "job_spec": job_spec,
-                                "config": reviewer_llm_config
-                            }
-
-                            self._log_prompt(f"COMPLIANCE_FILE_{fname}", "REVIEWER", {
-                                "system_prompt": "FILE_COMPLIANCE_PROMPT",
-                                "user_message": f"file={fname} ({len(file_code)} chars)",
-                                "plan_spec": plan_spec_str,
-                                "code": file_code,
-                                "job_spec": job_spec
-                            }, mode="compliance_file")
-
-                            output = self._run_external_agent("reviewer", payload)
-
-                            if output.get("status") == "error":
-                                per_file_results[fname] = f"ERROR: {output.get('error')}"
-                                print(f"    ✗ {fname}: ERROR — {output.get('error')}")
-                                continue
-
-                            file_review = output.get("result", "")
-                            per_file_results[fname] = file_review
-
-                            self._log_prompt(f"COMPLIANCE_FILE_{fname}_RESULT", "REVIEWER", {
-                                "system_prompt": "FILE_COMPLIANCE_PROMPT",
-                                "user_message": "RESULT",
-                                "result": file_review
-                            }, mode="compliance_file")
-
-                            # Parse STATUS: PASS|FAIL from result
-                            file_status_upper = file_review.upper()
-                            if "STATUS: FAIL" in file_status_upper or "STATUS:FAIL" in file_status_upper:
-                                failed_files.append(fname)
-                                print(f"    ✗ {fname}: FAIL")
-                            else:
-                                print(f"    ✓ {fname}: PASS")
-
-                            report_parts.append(file_review)
-                            report_parts.append("")
-
-                        # Check for files in code but not in plan (extra files — just note them)
-                        plan_file_names = {f.name for f in plan_parsed.files}
-                        for fname in all_files_dict:
-                            if fname not in plan_file_names and not fname.endswith("__init__.py"):
-                                report_parts.append(f"FILE: {fname}\nNOTE: Extra file not in plan (not reviewed)\n")
-
-                        # Assemble overall report
-                        if failed_files:
-                            report_parts.append(f"\nOVERALL: STATUS: NEEDS_REVISION")
-                            report_parts.append(f"Failed files: {', '.join(failed_files)}")
-                        else:
-                            report_parts.append(f"\nOVERALL: STATUS: APPROVED")
-
-                        result_text = "\n".join(report_parts)
-                        task.result = result_text
-
-                        # Store per-file results and failed files in metadata for revision
-                        task.metadata["per_file_results"] = per_file_results
-                        task.metadata["failed_files"] = failed_files
-
-                        if failed_files:
-                            task.metadata["needs_revision"] = True
-                            task.metadata["final_plan"] = final_plan
-                            print(f"  ⚠ Compliance review: NEEDS_REVISION ({len(failed_files)} files)")
-                        else:
-                            print(f"  ✓ Compliance review: APPROVED (all {len(plan_parsed.files)} files pass)")
-
+                    # Check if revision is needed
+                    if "NEEDS_REVISION" in result_text.upper() or "STATUS: NEEDS_REVISION" in result_text.upper():
+                        task.metadata["needs_revision"] = True
+                        task.metadata["final_plan"] = final_plan
+                        print(f"  ⚠ Compliance review: NEEDS_REVISION")
                     else:
-                        # FALLBACK: single-call compliance review (backward compat)
-                        payload = {
-                            "mode": "compliance",
-                            "plan_yaml": final_plan,
-                            "code": latest_code,
-                            "job_spec": job_spec,
-                            "config": reviewer_llm_config
-                        }
-                        # Override max_tokens for full-code review
-                        payload["config"]["max_tokens"] = reviewer_config.get("max_tokens", 35000)
-
-                        self._log_prompt("COMPLIANCE", "REVIEWER", {
-                            "system_prompt": "COMPLIANCE_PROMPT",
-                            "user_message": f"PLAN + CODE + JOB_SPEC ({len(latest_code)} chars code)",
-                            "plan_yaml": final_plan, "code": latest_code, "job_spec": job_spec
-                        }, mode="compliance")
-
-                        output = self._run_external_agent("reviewer", payload)
-                        if output.get("status") == "error":
-                            raise Exception(output.get("error"))
-
-                        result_text = output.get("result", "")
-                        task.result = result_text
-
-                        self._log_prompt("COMPLIANCE_RESULT", "REVIEWER", {
-                            "system_prompt": "COMPLIANCE_PROMPT",
-                            "user_message": "RESULT", "result": result_text
-                        }, mode="compliance")
-
-                        if "NEEDS_REVISION" in result_text.upper() or "STATUS: NEEDS_REVISION" in result_text.upper():
-                            task.metadata["needs_revision"] = True
-                            task.metadata["final_plan"] = final_plan
-                            print(f"  ⚠ Compliance review: NEEDS_REVISION")
-                        else:
-                            print(f"  ✓ Compliance review: APPROVED")
+                        print(f"  ✓ Compliance review: APPROVED")
 
                     task.status = TaskStatus.COMPLETED
                 except Exception as e:
@@ -2392,18 +1983,57 @@ Be specific and reference actual code from the project."""
                     self._save_project_outputs()
                 except Exception as e:
                     print(f"Warning: save failed before verify: {e}")
-
-                # RUN SMOKE TESTS LOCALLY (informational — not a hard gate)
+                
+                # RUN SMOKE TESTS LOCALLY
                 smoke_tests = self._run_smoke_tests()
                 task.metadata["smoke_tests"] = smoke_tests
+                
+                # Smart smoke test failure check
+                def _smoke_failed(results):
+                    failing = []
+                    project_type = self.state["project_info"].get("project_type", "cli")
+                    for name, info in (results or {}).items():
+                        rc = info.get("returncode", None)
+                        # Skip CLI checks for non-CLI projects (libraries, services)
+                        if name in ("cli_usage", "cli_help"):
+                            if project_type in ("library", "service"):
+                                continue
+                            if rc in (0, 2):
+                                continue
+                        if rc != 0:
+                            failing.append(f"{name} (rc={rc})")
+                    return (len(failing) > 0), failing
 
-                # Log smoke results for visibility
-                for name, info in (smoke_tests or {}).items():
-                    rc = info.get("returncode", None)
-                    status_icon = "PASS" if rc == 0 else "FAIL"
-                    print(f"   Smoke: {name} → {status_icon} (rc={rc})")
+                failed, failing_list = _smoke_failed(smoke_tests)
+                
+                if failed:
+                    print("\n" + "=" * 80)
+                    print("❌ SMOKE TESTS FAILED - AUTO-REJECTING")
+                    print("=" * 80)
+                    print("Smoke tests failed:")
+                    for item in failing_list:
+                        print(f" - {item}")
+                    print("\nSmoke test details:")
+                    for name, info in smoke_tests.items():
+                        print("-" * 40)
+                        print(f"{name}: {info.get('cmd')}")
+                        print(f"returncode: {info.get('returncode')}")
+                        stdout = (info.get("stdout") or "").strip()
+                        stderr = (info.get("stderr") or "").strip()
+                        if stdout:
+                            print("stdout:")
+                            print(stdout[:4000])
+                        if stderr:
+                            print("stderr:")
+                            print(stderr[:4000])
+                    print("=" * 80)
 
-                # Always proceed to LLM verification — smoke results are passed as context
+                    task.status = TaskStatus.FAILED
+                    task.error = "Smoke tests failed: " + ", ".join(failing_list)
+                    task.completed_at = time.time()
+                    return task
+
+                # Continue to External Agent (smoke tests passed)
                 system_prompt, user_message = self._get_verifier_prompt(task)
                 ver_config = self.executor._get_agent_config(AgentRole.VERIFIER)
 
@@ -2414,8 +2044,8 @@ Be specific and reference actual code from the project."""
                         "model_url": ver_config.get("url", "http://localhost:1233/v1"),
                         "model_name": ver_config.get("model", "local-model"),
                         "api_type": ver_config.get("api_type", "openai"),
-                        "temperature": ver_config.get("temperature", 0.3),
-                        "max_tokens": ver_config.get("max_tokens", 35000),
+                        "temperature": 0.3,
+                        "max_tokens": 3000,
                         "timeout": ver_config.get("timeout", 600)
                     }
                 }
@@ -2424,26 +2054,26 @@ Be specific and reference actual code from the project."""
                     output = self._run_external_agent("verifier", payload)
                     if output.get("status") == "error":
                         raise Exception(output.get("error"))
-
+                    
                     result = output.get("result", "")
                     task.result = result
 
                     # Parse verification result
                     resp_upper = (result or "").upper()
-
+                    
                     # Check for explicit FAIL first
                     explicit_fail = "VERIFICATION: FAIL" in resp_upper
-
+                    
                     # Check for pass conditions (PASS, WARN with APPROVE, or just APPROVE)
                     explicit_pass = "VERIFICATION: PASS" in resp_upper
                     warn_with_approve = ("VERIFICATION: WARN" in resp_upper and "RECOMMENDATION: APPROVE" in resp_upper)
                     recommend_approve = "RECOMMENDATION: APPROVE" in resp_upper and not explicit_fail
-
+                    
                     passed = (explicit_pass or warn_with_approve or recommend_approve) and not explicit_fail
 
                     if not passed:
                         print("\n" + "=" * 80)
-                        print("VERIFICATION FAILED")
+                        print("⚠️ VERIFICATION FAILED")
                         print("=" * 80)
                         print(result)
                         print("=" * 80)
@@ -2459,7 +2089,7 @@ Be specific and reference actual code from the project."""
                 except Exception as e:
                     task.status = TaskStatus.FAILED
                     task.error = str(e)
-
+                
                 task.completed_at = time.time()
                 return task
 
@@ -2474,8 +2104,8 @@ Be specific and reference actual code from the project."""
                         "model_url": clarifier_config.get("url", "http://localhost:1233/v1"),
                         "model_name": clarifier_config.get("model", "local-model"),
                         "api_type": clarifier_config.get("api_type", "openai"),
-                        "temperature": clarifier_config.get("temperature", 0.7),
-                        "max_tokens": clarifier_config.get("max_tokens", 35000),
+                        "temperature": 0.7,
+                        "max_tokens": 2000,
                         "timeout": clarifier_config.get("timeout", 300)
                     }
                 }
@@ -2517,8 +2147,8 @@ Be specific and reference actual code from the project."""
                             "model_url": architect_config.get("url", "http://localhost:1233/v1"),
                             "model_name": architect_config.get("model", "local-model"),
                             "api_type": architect_config.get("api_type", "openai"),
-                            "temperature": architect_config.get("temperature", 0.6),
-                            "max_tokens": architect_config.get("max_tokens", 35000),
+                            "temperature": 0.6,
+                            "max_tokens": 3000,
                             "timeout": architect_config.get("timeout", 600)
                         }
                     }
@@ -2552,21 +2182,15 @@ Be specific and reference actual code from the project."""
                 if len(user_message) // 4 > 20000:
                     print(f"  ⚠ Large context warning for {task.task_id}")
 
-                # Inject tool context from toolsmith if available
-                tool_context = self.state["context"].get("tool_context", "")
-                if tool_context:
-                    user_message = user_message + f"\n\n{tool_context}"
-
                 payload = {
                     "system_prompt": system_prompt,
                     "user_message": user_message,
-                    "tool_context": tool_context,
                     "config": {
                         "model_url": coder_config.get("url", "http://localhost:1233/v1"),
                         "model_name": coder_config.get("model", "local-model"),
                         "api_type": coder_config.get("api_type", "openai"),
-                        "temperature": coder_config.get("temperature", 0.2),
-                        "max_tokens": coder_config.get("max_tokens", 35000),
+                        "temperature": 0.5,
+                        "max_tokens": 6000,
                         "timeout": coder_config.get("timeout", 1200)
                     }
                 }
@@ -2635,8 +2259,8 @@ Be specific and reference actual code from the project."""
                         "model_url": reviewer_config.get("url", "http://localhost:1233/v1"),
                         "model_name": reviewer_config.get("model", "local-model"),
                         "api_type": reviewer_config.get("api_type", "openai"),
-                        "temperature": reviewer_config.get("temperature", 0.8),
-                        "max_tokens": reviewer_config.get("max_tokens", 35000),
+                        "temperature": 0.8,
+                        "max_tokens": 3000,
                         "timeout": reviewer_config.get("timeout", 600)
                     }
                 }
@@ -2682,8 +2306,8 @@ Be specific and reference actual code from the project."""
                         "model_url": tester_config.get("url", "http://localhost:1233/v1"),
                         "model_name": tester_config.get("model", "local-model"),
                         "api_type": tester_config.get("api_type", "openai"),
-                        "temperature": tester_config.get("temperature", 0.7),
-                        "max_tokens": tester_config.get("max_tokens", 35000),
+                        "temperature": 0.7,
+                        "max_tokens": 4000,
                         "timeout": tester_config.get("timeout", 600)
                     }
                 }
@@ -2717,8 +2341,8 @@ Be specific and reference actual code from the project."""
                         "model_url": doc_config.get("url", "http://localhost:1233/v1"),
                         "model_name": doc_config.get("model", "local-model"),
                         "api_type": doc_config.get("api_type", "openai"),
-                        "temperature": doc_config.get("temperature", 0.7),
-                        "max_tokens": doc_config.get("max_tokens", 35000),
+                        "temperature": 0.7,
+                        "max_tokens": 3000,
                         "timeout": doc_config.get("timeout", 600)
                     }
                 }
@@ -2756,8 +2380,8 @@ Be specific and reference actual code from the project."""
                         "model_url": sec_config.get("url", "http://localhost:1233/v1"),
                         "model_name": sec_config.get("model", "local-model"),
                         "api_type": sec_config.get("api_type", "openai"),
-                        "temperature": sec_config.get("temperature", 0.8),
-                        "max_tokens": sec_config.get("max_tokens", 35000),
+                        "temperature": 0.8,
+                        "max_tokens": 3000,
                         "timeout": sec_config.get("timeout", 600)
                     }
                 }
@@ -2790,8 +2414,8 @@ Be specific and reference actual code from the project."""
                         "model_url": opt_config.get("url", "http://localhost:1233/v1"),
                         "model_name": opt_config.get("model", "local-model"),
                         "api_type": opt_config.get("api_type", "openai"),
-                        "temperature": opt_config.get("temperature", 0.6),
-                        "max_tokens": opt_config.get("max_tokens", 35000),
+                        "temperature": 0.6,
+                        "max_tokens": 4000,
                         "timeout": opt_config.get("timeout", 600)
                     }
                 }
@@ -2812,24 +2436,46 @@ Be specific and reference actual code from the project."""
                 return task
 
             # --- 10. VERIFIER TASK (External: Verifier) ---
-            # NOTE: Smoke tests run locally but failures are informational, not hard gates
+            # NOTE: Verifier requires smoke tests to run LOCALLY first
             if task.task_type == "verification" and task.assigned_role == AgentRole.VERIFIER:
-                # 1. Save outputs & Run Smoke Tests (informational)
+                # 1. Save outputs & Run Smoke Tests (Internal Coordinator Logic)
                 try:
                     self._save_project_outputs()
                 except Exception as e:
                     print(f"   ! Warning: failed to save before verification: {e}")
-
+                
+                # Run the smoke tests using the internal method
                 smoke_tests = self._run_smoke_tests()
                 task.metadata["smoke_tests"] = smoke_tests
+                
+                # Check for hard failures (Fast Fail)
+                def _smoke_failed(results):
+                    failing = []
+                    project_type = self.state["project_info"].get("project_type", "cli")
+                    for name, info in (results or {}).items():
+                        rc = info.get("returncode", None)
+                        # Skip CLI checks for non-CLI projects (libraries, services)
+                        if name in ("cli_usage", "cli_help"):
+                            if project_type in ("library", "service"):
+                                continue
+                            if rc in (0, 2):
+                                continue
+                        if rc != 0:
+                            failing.append(f"{name} (rc={rc})")
+                    return (len(failing) > 0), failing
 
-                # Log smoke results for visibility
-                for name, info in (smoke_tests or {}).items():
-                    rc = info.get("returncode", None)
-                    status_icon = "PASS" if rc == 0 else "FAIL"
-                    print(f"   Smoke: {name} → {status_icon} (rc={rc})")
 
-                # 2. Always send to LLM for holistic evaluation (smoke results included in prompt)
+                failed, failing_list = _smoke_failed(smoke_tests)
+                if failed:
+                    print("SMOKE TEST DETAILS:")
+                    print(json.dumps(smoke_tests, indent=2))
+                    task.status = TaskStatus.FAILED
+                    task.error = "Smoke tests failed: " + ", ".join(failing_list)
+                    task.completed_at = time.time()
+                    return task
+
+
+                # 2. Prepare Prompt for External Agent
                 system_prompt, user_message = self._get_verifier_prompt(task)
                 ver_config = self.executor._get_agent_config(AgentRole.VERIFIER)
 
@@ -2840,27 +2486,34 @@ Be specific and reference actual code from the project."""
                         "model_url": ver_config.get("url", "http://localhost:1233/v1"),
                         "model_name": ver_config.get("model", "local-model"),
                         "api_type": ver_config.get("api_type", "openai"),
-                        "temperature": ver_config.get("temperature", 0.3),
-                        "max_tokens": ver_config.get("max_tokens", 35000),
+                        "temperature": 0.3,
+                        "max_tokens": 3000,
                         "timeout": ver_config.get("timeout", 600)
                     }
                 }
 
                 try:
+                    # 3. Call External Agent
                     output = self._run_external_agent("verifier", payload)
                     if output.get("status") == "error":
                         raise Exception(output.get("error"))
-
+                    
                     result = output.get("result", "")
                     task.result = result
 
+                    # 4. Parse Result
                     resp_upper = (result or "").upper()
+                    
+                    # Check for explicit FAIL first
                     explicit_fail = "VERIFICATION: FAIL" in resp_upper
+                    
+                    # Check for pass conditions (PASS, WARN with APPROVE, or just APPROVE)
                     explicit_pass = "VERIFICATION: PASS" in resp_upper
                     warn_with_approve = ("VERIFICATION: WARN" in resp_upper and "RECOMMENDATION: APPROVE" in resp_upper)
                     recommend_approve = "RECOMMENDATION: APPROVE" in resp_upper and not explicit_fail
+                    
                     passed = (explicit_pass or warn_with_approve or recommend_approve) and not explicit_fail
-
+                    
                     if passed:
                         task.status = TaskStatus.COMPLETED
                     else:
@@ -2870,7 +2523,7 @@ Be specific and reference actual code from the project."""
                 except Exception as e:
                     task.status = TaskStatus.FAILED
                     task.error = str(e)
-
+                
                 task.completed_at = time.time()
                 return task
 
@@ -2884,45 +2537,6 @@ Be specific and reference actual code from the project."""
         
         return task
     
-    def _build_environment_context(self) -> str:
-        """Build a description of the runtime environment (LLM endpoints, etc.) for the coder."""
-        lines = []
-        lines.append("RUNTIME ENVIRONMENT (use this info to write real LLM integration):")
-        lines.append("-" * 60)
-
-        model_config = self.config.get("model_config", {})
-        mode = model_config.get("mode", "single")
-
-        if mode == "single":
-            sm = model_config.get("single_model", {})
-            lines.append(f"LLM Endpoint: {sm.get('url', 'http://localhost:11434')}")
-            lines.append(f"Model: {sm.get('model', 'local-model')}")
-            lines.append(f"API Type: {sm.get('api_type', 'ollama')}")
-        else:
-            # Multi-model: pick the coder's endpoint as the representative one
-            mm = model_config.get("multi_model", {})
-            coder_m = mm.get("coder", {})
-            lines.append(f"LLM Endpoint: {coder_m.get('url', 'http://localhost:1234/v1')}")
-            lines.append(f"Model: {coder_m.get('model', 'local-model')}")
-            lines.append(f"API Type: {coder_m.get('api_type', 'openai')}")
-
-        lines.append("")
-        lines.append("To call the LLM from generated code, use:")
-        lines.append("  import requests")
-        lines.append("  response = requests.post(f\"{endpoint}/chat/completions\", json={")
-        lines.append("      \"model\": model_name,")
-        lines.append("      \"messages\": [{\"role\": \"user\", \"content\": prompt}],")
-        lines.append("      \"temperature\": 0.7")
-        lines.append("  })")
-        lines.append("  result = response.json()[\"choices\"][0][\"message\"][\"content\"]")
-        lines.append("")
-        lines.append("This is a LOCAL LLM — no API key needed. Use it for any agent that")
-        lines.append("needs to analyze text, generate hypotheses, summarize papers, etc.")
-        lines.append("Do NOT mock or simulate LLM calls — actually call the endpoint above.")
-        lines.append("-" * 60)
-
-        return "\n".join(lines)
-
     def _clean_code_output(self, code: str) -> str:
         """Clean markdown formatting and explanatory text from code output"""
         
@@ -3153,8 +2767,8 @@ Be specific and reference actual code from the project."""
                 "model_url": clarifier_config.get("url", "http://localhost:1233/v1"),
                 "model_name": clarifier_config.get("model", "local-model"),
                 "api_type": clarifier_config.get("api_type", "openai"),
-                "temperature": clarifier_config.get("temperature", 0.7),
-                "max_tokens": clarifier_config.get("max_tokens", 35000),
+                "temperature": 0.7,
+                "max_tokens": 3000,
                 "timeout": clarifier_config.get("timeout", 300)
             }
         }
@@ -3166,7 +2780,7 @@ Be specific and reference actual code from the project."""
         # Log the prompt
         self._log_prompt("SYNTHESIZE", "CLARIFIER", {
             "system_prompt": "SYNTHESIZE_STRUCTURED_PROMPT" if output_format == "structured" else "SYNTHESIZE_PROMPT",
-            "user_message": f"Request: {user_request}\n\nQ&A: {result}\n\nAnswers: {answers_text}"
+            "user_message": f"Request: {user_request[:200]}... Q&A: {result[:200]}..."
         }, mode=f"synthesize_{output_format}" if output_format else "synthesize")
 
         try:
@@ -3200,205 +2814,22 @@ Be specific and reference actual code from the project."""
 
         print("\n✓ Clarification complete, proceeding with workflow...")
     
-    def _handle_file_by_file_revision(self, review_task: Task) -> bool:
-        """
-        Handle revision using PlanExecutor for each failed file.
-
-        Uses PlanExecutor._handle_revision() for anti-stub prompt, AST detection,
-        export validation, retries, and fallback coder — matching the build phase.
-
-        Returns True if revision was performed successfully.
-        """
-        if not PLAN_EXECUTOR_AVAILABLE:
-            return False
-
-        failed_files = review_task.metadata.get("failed_files", [])
-        per_file_results = review_task.metadata.get("per_file_results", {})
-        final_plan = review_task.metadata.get("final_plan") or self.state["context"].get("final_plan", "")
-        latest_code = self.state["context"].get("latest_code", "")
-        user_request = self.state["context"].get("user_request", "")
-        job_spec = self.state["context"].get("job_spec", self.state["context"].get("job_scope", ""))
-
-        if not failed_files or not final_plan:
-            return False
-
-        # Parse current code and plan
-        all_files_dict = self._parse_multi_file_output(latest_code) if latest_code else {}
-        if not all_files_dict:
-            return False
-
-        try:
-            project_dir = self.state["project_info"].get("project_dir", "")
-            plan_exec = PlanExecutor(
-                executor=self.executor,
-                config=self.config,
-                project_dir=project_dir
-            )
-            plan_exec.plan = plan_exec.parse_plan(final_plan)
-            plan_exec.job_scope = job_spec or user_request
-        except Exception as e:
-            print(f"  ⚠ Could not initialize PlanExecutor for revision: {e}")
-            return False
-
-        # Pre-populate completed_files with all current code
-        for fname, fcode in all_files_dict.items():
-            file_spec = plan_exec._get_file_spec(fname)
-            actual_exports = plan_exec._extract_exports(fcode)
-            plan_exec.completed_files[fname] = FileResult(
-                name=fname,
-                content=fcode,
-                actual_exports=actual_exports,
-                status=FileStatus.COMPLETED
-            )
-
-        print(f"\n🔄 File-by-file revision ({len(failed_files)} files to revise)")
-
-        revised_any = False
-        for fname in failed_files:
-            file_spec = plan_exec._get_file_spec(fname)
-            reviewer_feedback = per_file_results.get(fname, "")
-
-            if not file_spec:
-                print(f"    ⚠ {fname}: not found in plan, skipping")
-                continue
-
-            self._log_prompt(f"COMPLIANCE_REVISION_{fname}", "CODER", {
-                "system_prompt": "(PlanExecutor revision)",
-                "user_message": f"Revising {fname}",
-                "revision_feedback": reviewer_feedback[:3000]
-            }, mode="compliance_revision")
-
-            context = plan_exec._build_context_for_file(file_spec)
-
-            existing_code = all_files_dict.get(fname, "")
-
-            if not existing_code:
-                # MISSING file — generate from scratch
-                print(f"    ▶ {fname}: generating (was missing)")
-                try:
-                    result = plan_exec._generate_file(file_spec, user_request, context)
-                    if result.status == FileStatus.PLAN_MISMATCH:
-                        result = plan_exec._handle_revision(file_spec, result, context, user_request)
-                except Exception as e:
-                    print(f"    ✗ {fname}: generation failed — {e}")
-                    continue
-            else:
-                # FAILED file — revise via PlanExecutor._handle_revision()
-                print(f"    ▶ {fname}: revising")
-                actual_exports = plan_exec._extract_exports(existing_code)
-
-                # Build a FileResult with the reviewer's feedback as compliance issues
-                issues = []
-                if reviewer_feedback:
-                    # Extract ISSUES REQUIRING REVISION section if present
-                    issues_match = re.search(
-                        r'ISSUES REQUIRING REVISION[:\s]*\n(.*?)(?:\n\n|\nFILE:|\nOVERALL:|\Z)',
-                        reviewer_feedback, re.DOTALL | re.IGNORECASE
-                    )
-                    if issues_match:
-                        for line in issues_match.group(1).strip().split('\n'):
-                            line = line.strip().lstrip('-').lstrip('0123456789.').strip()
-                            if line and line.lower() != "none":
-                                issues.append(line)
-                    # Also extract STUB AUDIT entries
-                    stub_match = re.search(
-                        r'STUB AUDIT[:\s]*\n(.*?)(?:\n\n|\nEXPORT|\nREQUIREMENTS|\nISSUES|\Z)',
-                        reviewer_feedback, re.DOTALL | re.IGNORECASE
-                    )
-                    if stub_match:
-                        for line in stub_match.group(1).strip().split('\n'):
-                            line = line.strip().lstrip('-').strip()
-                            if line and "no stub" not in line.lower() and "none" not in line.lower():
-                                issues.append(f"STUB: {line}")
-
-                if not issues:
-                    issues = [reviewer_feedback[:2000]]
-
-                current_result = FileResult(
-                    name=fname,
-                    content=existing_code,
-                    actual_exports=actual_exports,
-                    status=FileStatus.PLAN_MISMATCH,
-                    plan_compliance={"passed": False, "issues": issues, "warnings": []}
-                )
-
-                try:
-                    result = plan_exec._handle_revision(file_spec, current_result, context, user_request)
-                except Exception as e:
-                    print(f"    ✗ {fname}: revision failed — {e}")
-                    continue
-
-            self._log_prompt(f"COMPLIANCE_REVISION_{fname}_RESULT", "CODER", {
-                "system_prompt": "(PlanExecutor revision result)",
-                "user_message": "RESULT",
-                "result": result.content[:5000] if result.content else "(empty)"
-            }, mode="compliance_revision")
-
-            if result.status == FileStatus.COMPLETED and result.content:
-                plan_exec.completed_files[fname] = result
-                all_files_dict[fname] = result.content
-                revised_any = True
-                print(f"    ✓ {fname}: revised successfully")
-            else:
-                print(f"    ⚠ {fname}: revision did not pass (keeping original)")
-
-        if not revised_any:
-            print(f"  ⚠ No files were successfully revised")
-            return False
-
-        # Merge revised files back into latest_code
-        combined_parts = []
-        for fname in plan_exec.plan.execution_order:
-            if fname in all_files_dict:
-                combined_parts.append(f"### FILE: {fname} ###\n{all_files_dict[fname]}")
-        # Include any extra files (e.g. __init__.py)
-        for fname, fcode in all_files_dict.items():
-            if fname not in plan_exec.plan.execution_order:
-                combined_parts.append(f"### FILE: {fname} ###\n{fcode}")
-        revised_code = "\n\n".join(combined_parts)
-
-        # Create synthetic revision task for _save_project_outputs
-        revision_task = Task(
-            task_id="T_compliance_revision",
-            task_type="revision",
-            description="File-by-file compliance revision",
-            assigned_role=AgentRole.CODER,
-            status=TaskStatus.COMPLETED,
-            priority=10,
-            metadata={"is_revision": True}
-        )
-        revision_task.result = revised_code
-        self.completed_tasks.append(revision_task)
-
-        # Update context
-        self.state["context"]["latest_code"] = revised_code
-        self._update_context(revision_task)
-
-        # Save to disk immediately
-        try:
-            self._save_project_outputs()
-        except Exception as e:
-            print(f"  ⚠ Error saving revised outputs: {e}")
-
-        print(f"  ✓ File-by-file revision complete")
-        return True
-
     def _handle_revision_cycle(self, review_tasks: List[Task]) -> bool:
         """
         Check if any review requires revision and handle the cycle.
         Returns True if revision was triggered.
         """
         needs_revision = any(
-            t.metadata.get("needs_revision", False)
-            for t in review_tasks
+            t.metadata.get("needs_revision", False) 
+            for t in review_tasks 
             if t.status == TaskStatus.COMPLETED
         )
-
+        
         if not needs_revision:
             return False
-
+        
         # Find the coding task (also check build_from_plan for collaborative workflow)
-        code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan")), None)
+        code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution", "build_from_plan")), None)
         if not code_task:
             return False
 
@@ -3406,15 +2837,6 @@ Be specific and reference actual code from the project."""
         if code_task.revision_count >= code_task.max_revisions:
             print(f"\n⚠ Max revisions ({code_task.max_revisions}) reached, proceeding anyway")
             return False
-
-        # Try file-by-file revision if compliance review has per_file_results
-        for rt in review_tasks:
-            if rt.task_type == "compliance_review" and rt.metadata.get("per_file_results"):
-                try:
-                    if self._handle_file_by_file_revision(rt):
-                        return True
-                except Exception as e:
-                    print(f"  ⚠ File-by-file revision failed: {e}, falling back to generic revision")
 
         print(f"\n🔄 Revision cycle {code_task.revision_count + 1}/{code_task.max_revisions}")
 
@@ -3424,41 +2846,10 @@ Be specific and reference actual code from the project."""
             if rt.result and rt.metadata.get("needs_revision"):
                 feedback.append(f"[{rt.task_id}]: {rt.result}")
 
-        # Build revision metadata — only include files needing revision to avoid context blowup
-        full_feedback = "\n\n".join(feedback)
-        all_files = self._parse_multi_file_output(code_task.result)
-        if all_files and len(code_task.result) > 30000:
-            # Extract which files need revision from the feedback
-            revision_files = {}
-            reference_signatures = []
-            feedback_lower = full_feedback.lower()
-            for fname, fcontent in all_files.items():
-                if fname.lower() in feedback_lower or fname.replace("/", ".").replace(".py","") in feedback_lower:
-                    revision_files[fname] = fcontent
-                else:
-                    # Include only class/function signatures for reference
-                    sig_lines = [f"# --- {fname} (reference only) ---"]
-                    for line in fcontent.split('\n'):
-                        stripped = line.strip()
-                        if stripped.startswith(('class ', 'def ', 'import ', 'from ')):
-                            sig_lines.append(line)
-                    reference_signatures.append('\n'.join(sig_lines[:30]))
-
-            # Assemble reduced original_code
-            parts = []
-            for fname, fcontent in revision_files.items():
-                parts.append(f"### FILE: {fname} ###\n{fcontent}")
-            if reference_signatures:
-                parts.append("\n# === OTHER FILES (signatures only — do NOT rewrite these) ===")
-                parts.append('\n\n'.join(reference_signatures))
-            reduced_code = '\n\n'.join(parts)
-            print(f"  Revision: sending {len(revision_files)} files to revise ({len(reduced_code)//1024}KB), {len(all_files) - len(revision_files)} as reference sigs")
-        else:
-            reduced_code = code_task.result
-
+        # Build revision metadata
         revision_metadata = {
-            "revision_feedback": full_feedback,
-            "original_code": reduced_code,
+            "revision_feedback": "\n\n".join(feedback),
+            "original_code": code_task.result,
             "user_request": self.state["context"].get("user_request", ""),
             "is_revision": True
         }
@@ -3482,32 +2873,16 @@ Be specific and reference actual code from the project."""
             metadata=revision_metadata
         )
         revision_task.revision_count = code_task.revision_count + 1
-
-        # Log the revision prompt
-        self._log_prompt(f"REVISION_{revision_task.revision_count}", "CODER", {
-            "system_prompt": "(revision system prompt)",
-            "user_message": f"Revision #{revision_task.revision_count}",
-            "revision_feedback": revision_metadata.get("revision_feedback", ""),
-            "original_code": revision_metadata.get("original_code", "")[:5000] + "..." if len(revision_metadata.get("original_code", "")) > 5000 else revision_metadata.get("original_code", ""),
-            "plan_yaml": revision_metadata.get("final_plan", "")
-        }, mode="revision")
-
+        
         # Execute revision
         self.execute_task(revision_task)
-
+        
         if revision_task.status == TaskStatus.COMPLETED:
-            # Log the revision result
-            self._log_prompt(f"REVISION_{revision_task.revision_count}_RESULT", "CODER", {
-                "system_prompt": "(revision result)",
-                "user_message": "RESULT",
-                "result": revision_task.result
-            }, mode="revision")
-
             # Update the context with revised code
             self._update_context(revision_task)
             self.completed_tasks.append(revision_task)
             return True
-
+        
         return False
     
     def run_workflow(self, user_request: str, workflow_type: str = "standard"):
@@ -3608,31 +2983,19 @@ Be specific and reference actual code from the project."""
             if review_tasks:
                 self._handle_revision_cycle(review_tasks)
         
-        # Save all outputs first (before anything else that might fail)
-        try:
-            self._save_project_outputs()
-            init_file = os.path.join(project_dir, "src", "__init__.py")
-            if not os.path.exists(init_file):
-                with open(init_file, "w", encoding="utf-8") as f:
-                    f.write("")
-        except Exception as e:
-            print(f"  ⚠ Error saving project outputs: {e}")
-
-        # Hand off to Tier 2 finisher pipeline
-        try:
-            self._handoff_to_tier2()
-        except Exception as e:
-            print(f"  ⚠ Tier 2 handoff failed (non-fatal): {e}")
-
         # Generate final report
-        try:
-            self._generate_workflow_report()
-        except Exception as e:
-            print(f"  ⚠ Error generating report: {e}")
+        self._generate_workflow_report()
+        
+        # Save all outputs
+        self._save_project_outputs()
+        init_file = os.path.join(project_dir, "src", "__init__.py")
+        if not os.path.exists(init_file):
+            with open(init_file, "w", encoding="utf-8") as f:
+                f.write("")
 
         # Print project summary
         self._print_project_summary()
-
+        
         # Cleanup Docker sandbox
         if self.sandbox:
             self.sandbox.stop()
@@ -3664,177 +3027,7 @@ Be specific and reference actual code from the project."""
         print(f"\n✓ All outputs saved to: {project_dir}")
         print(f"✓ Project number: {self.state['project_info']['project_number']:03d}")
         print(f"✓ Version: {self.state['project_info']['version']}")
-
-    def _handoff_to_tier2(self):
-        """
-        Hand off the completed project to the Tier 2 finisher pipeline.
-
-        Scans the project's src/ directory, builds a manifest.json, and copies
-        everything into the tier2 handoff directory.  The tier2 watcher (or a
-        manual orchestrator run) picks it up from there.
-        """
-        import ast as _ast
-        import shutil
-        from pathlib import Path
-        from datetime import timezone
-
-        project_dir = self.state["project_info"].get("project_dir")
-        if not project_dir or not os.path.isdir(project_dir):
-            return
-
-        # Use the full directory name (e.g. "135_swarm_project_eve_v1") so tier2
-        # output folders match the swarm_v5 naming convention.
-        project_name = os.path.basename(os.path.normpath(project_dir))
-
-        # ---- configurable paths ------------------------------------------------
-        tier2_finisher_root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                           "..", "tier2_finisher")
-        tier2_finisher_root = os.path.normpath(tier2_finisher_root)
-
-        # Fall back to hard-coded sibling path if the relative lookup misses
-        if not os.path.isdir(tier2_finisher_root):
-            tier2_finisher_root = os.path.expanduser("~/projects/tier2_finisher")
-        if not os.path.isdir(tier2_finisher_root):
-            print("  ⚠ tier2_finisher not found, skipping handoff")
-            return
-
-        handoff_dir = os.path.join(tier2_finisher_root, "handoff")
-        # -----------------------------------------------------------------------
-
-        # The swarm writes generated code into src/, so that's what tier2 processes.
-        src_dir = os.path.join(project_dir, "src")
-        if not os.path.isdir(src_dir):
-            src_dir = project_dir  # fallback: project root
-
-        # ---- scan the source tree for modules / classes / entry points ----------
-        expected_modules = []
-        expected_classes = []
-        expected_entry_points = []
-
-        src_path = Path(src_dir)
-        for py_file in sorted(src_path.rglob("*.py")):
-            if "__pycache__" in py_file.parts:
-                continue
-            rel = str(py_file.relative_to(src_path))
-            expected_modules.append(rel)
-            try:
-                source = py_file.read_text(encoding="utf-8")
-                tree = _ast.parse(source)
-            except Exception:
-                continue
-            for node in _ast.walk(tree):
-                if isinstance(node, _ast.ClassDef):
-                    expected_classes.append(node.name)
-            if py_file.name == "main.py" or ("if __name__" in source and "__main__" in source):
-                expected_entry_points.append(rel)
-
-        if not expected_entry_points:
-            expected_entry_points = ["main.py"]
-
-        # ---- read original spec from PROJECT_INFO.txt ---------------------------
-        spec_text = ""
-        info_path = os.path.join(project_dir, "PROJECT_INFO.txt")
-        if os.path.isfile(info_path):
-            try:
-                spec_text = Path(info_path).read_text(encoding="utf-8")
-            except Exception:
-                pass
-
-        # If no PROJECT_INFO.txt, fall back to user_request from state
-        if not spec_text:
-            spec_text = self.state.get("context", {}).get("user_request", "")
-
-        # ---- build manifest ------------------------------------------------------
-        manifest = {
-            "project_name": project_name,
-            "tier1_timestamp": datetime.now(timezone.utc).isoformat(),
-            "tier1_version": "swarm_v5",
-            "entry_point": expected_entry_points[0] if expected_entry_points else "main.py",
-            "language": "python",
-            "framework": None,
-            "original_spec": spec_text,
-            "expected_modules": expected_modules,
-            "expected_classes": list(dict.fromkeys(expected_classes)),
-            "expected_entry_points": expected_entry_points,
-            "max_repair_cycles": 3,
-            "eve_callback_url": None,
-        }
-
-        # ---- copy to handoff dir -------------------------------------------------
-        dest = os.path.join(handoff_dir, project_name)
-        output_dest = os.path.join(dest, "output")
-
-        if os.path.exists(dest):
-            shutil.rmtree(dest)
-        shutil.copytree(src_dir, output_dest)
-
-        manifest_path = os.path.join(dest, "manifest.json")
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
-
-        print(f"\n✓ Tier 2 handoff: {dest}")
-        print(f"  Manifest: {manifest_path}")
-        print(f"  Modules:  {len(expected_modules)}  Classes: {len(manifest['expected_classes'])}  Entries: {expected_entry_points}")
-
-        # ---- run tier2 orchestrator directly ------------------------------------
-        # Add tier2_finisher to sys.path so we can import the orchestrator
-        if tier2_finisher_root not in sys.path:
-            sys.path.insert(0, tier2_finisher_root)
-
-        try:
-            from tier2_orchestrator import Tier2Orchestrator
-
-            # Load tier2 config from YAML if available, otherwise use defaults
-            tier2_config_path = os.path.join(tier2_finisher_root, "tier2_config.yaml")
-            tier2_config = {}
-            if os.path.isfile(tier2_config_path):
-                import yaml as _yaml
-                with open(tier2_config_path, "r") as f:
-                    tier2_config = _yaml.safe_load(f) or {}
-
-            # Override dirs to use local paths
-            tier2_config["workspace_dir"] = os.path.join(tier2_finisher_root, "workspace")
-            tier2_config["completed_dir"] = os.path.join(tier2_finisher_root, "completed")
-            tier2_config["failed_dir"] = os.path.join(tier2_finisher_root, "failed")
-            tier2_config["projects_dir"] = os.path.join(tier2_finisher_root, "projects")
-
-            print(f"\n{'='*60}")
-            print("TIER 2 FINISHER — PROCESSING")
-            print(f"{'='*60}\n")
-
-            orchestrator = Tier2Orchestrator(tier2_config)
-            orchestrator.process(output_dest, manifest)
-
-            # Show result — look in projects/{name}_tier2/ first
-            tier2_project_name = f"{project_name}_tier2"
-            projects_summary = os.path.join(
-                tier2_config["projects_dir"], tier2_project_name, "tier2_summary.json"
-            )
-            if os.path.isfile(projects_summary):
-                with open(projects_summary, "r") as f:
-                    summary = json.load(f)
-                output_path = os.path.join(tier2_config["projects_dir"], tier2_project_name)
-                print(f"\n{'='*60}")
-                print("TIER 2 RESULT")
-                print(f"{'='*60}")
-                print(f"  Verdict:        {summary.get('audit_verdict', 'UNKNOWN')}")
-                print(f"  Health score:   {summary.get('final_health_score', 'N/A')}")
-                print(f"  Repair cycles:  {summary.get('total_repair_cycles', 0)}")
-                print(f"  Test status:    {summary.get('final_test_summary', {}).get('overall_status', 'N/A')}")
-                print(f"  Output:         {output_path}")
-            else:
-                # Check failed dir
-                failed_path = os.path.join(tier2_config["failed_dir"], project_name)
-                if os.path.isdir(failed_path):
-                    print(f"\n  ⚠ Tier 2 moved project to failed: {failed_path}")
-
-        except ImportError as e:
-            print(f"  ⚠ Could not import tier2_orchestrator: {e}")
-            print(f"    Files are staged at {dest} for manual processing.")
-        except Exception as e:
-            print(f"  ⚠ Tier 2 processing failed: {e}")
-            print(f"    Files are staged at {dest} for manual processing.")
-
+    
     def _create_standard_workflow(self, user_request: str):
         """Create standard coding workflow: clarify -> architect -> code -> review -> document -> verify"""
         
@@ -3861,64 +3054,52 @@ Be specific and reference actual code from the project."""
             metadata={"user_request": user_request}
         ))
         
-        # Task 3: Tool Check (search Tool Forge before coding)
+        # Task 3: Coding
         self.add_task(Task(
-            task_id="T003_tool_check",
-            task_type="tool_check",
-            description="Check Tool Forge for reusable tools",
-            assigned_role=AgentRole.TOOLSMITH,
+            task_id="T003_code",
+            task_type="coding",
+            description="Implement the code",
+            assigned_role=AgentRole.CODER,
             status=TaskStatus.PENDING,
             priority=8,
             dependencies=["T002_architect"],
             metadata={"user_request": user_request}
         ))
-
-        # Task 4: Coding (with tool context from toolsmith)
-        self.add_task(Task(
-            task_id="T004_code",
-            task_type="coding",
-            description="Implement the code",
-            assigned_role=AgentRole.CODER,
-            status=TaskStatus.PENDING,
-            priority=7,
-            dependencies=["T003_tool_check"],
-            metadata={"user_request": user_request}
-        ))
-
-        # Tasks 5-7: Multiple reviewers in parallel
+        
+        # Tasks 4-6: Multiple reviewers in parallel
         for i in range(1, 4):
             self.add_task(Task(
-                task_id=f"T00{4+i}_review{i}",
+                task_id=f"T00{3+i}_review{i}",
                 task_type="review",
                 description=f"Code review #{i}",
                 assigned_role=AgentRole.REVIEWER,
                 status=TaskStatus.PENDING,
-                priority=6,
-                dependencies=["T004_code"],
+                priority=7,
+                dependencies=["T003_code"],
                 metadata={"reviewer_number": i, "user_request": user_request}
             ))
-
-        # Task 8: Documentation
+        
+        # Task 7: Documentation
         self.add_task(Task(
-            task_id="T008_document",
+            task_id="T007_document",
             task_type="documentation",
             description="Generate documentation",
             assigned_role=AgentRole.DOCUMENTER,
             status=TaskStatus.PENDING,
-            priority=5,
-            dependencies=["T005_review1", "T006_review2", "T007_review3"],
+            priority=6,
+            dependencies=["T004_review1", "T005_review2", "T006_review3"],
             metadata={"user_request": user_request}
         ))
-
-        # Task 9: Verification
+        
+        # Task 8: Verification
         self.add_task(Task(
-            task_id="T009_verify",
+            task_id="T008_verify",
             task_type="verification",
             description="Verify docs match code",
             assigned_role=AgentRole.VERIFIER,
             status=TaskStatus.PENDING,
-            priority=4,
-            dependencies=["T008_document"]
+            priority=5,
+            dependencies=["T007_document"]
         ))
     
     def _create_full_workflow(self, user_request: str):
@@ -4076,39 +3257,27 @@ Be specific and reference actual code from the project."""
             metadata={"user_request": user_request}
         ))
 
-        # T005: Tool Check (Toolsmith checks for reusable tools before coding)
+        # T005: Build (Coder builds all code from final plan)
         self.add_task(Task(
-            task_id="T005_tool_check",
-            task_type="tool_check",
-            description="Check Tool Forge for reusable tools",
-            assigned_role=AgentRole.TOOLSMITH,
+            task_id="T005_build",
+            task_type="build_from_plan",
+            description="Build all code from finalized plan",
+            assigned_role=AgentRole.CODER,
             status=TaskStatus.PENDING,
             priority=6,
             dependencies=["T004_final_plan"],
             metadata={"user_request": user_request}
         ))
 
-        # T006: Build (Coder builds all code from final plan + tool context)
+        # T006: Compliance Review
         self.add_task(Task(
-            task_id="T006_build",
-            task_type="build_from_plan",
-            description="Build all code from finalized plan",
-            assigned_role=AgentRole.CODER,
-            status=TaskStatus.PENDING,
-            priority=5,
-            dependencies=["T005_tool_check"],
-            metadata={"user_request": user_request}
-        ))
-
-        # T007: Compliance Review
-        self.add_task(Task(
-            task_id="T007_compliance",
+            task_id="T006_compliance",
             task_type="compliance_review",
             description="Verify code implements the plan correctly",
             assigned_role=AgentRole.REVIEWER,
             status=TaskStatus.PENDING,
-            priority=4,
-            dependencies=["T006_build"],
+            priority=5,
+            dependencies=["T005_build"],
             metadata={"user_request": user_request}
         ))
 
@@ -4635,7 +3804,7 @@ OUTPUT YOUR COMPLETE REVISED CODE BELOW:
         
         # FIXED: For documenter, ensure code is included (with smart truncation)
         if task.task_type == "documentation":
-            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan")), None)
+            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution")), None)
             if code_task and code_task.result and "coding" not in str(task.dependencies):
                 # For multi-file projects, provide structure summary + key file contents
                 files_dict = self._parse_multi_file_output(code_task.result)
@@ -4689,7 +3858,7 @@ OUTPUT YOUR COMPLETE REVISED CODE BELOW:
         
         # FIXED: For security audit, ensure code is included
         if task.task_type == "security_audit":
-            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan")), None)
+            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution")), None)
             if code_task and code_task.result:
                 message_parts.append(f"\nCODE TO ANALYZE FOR SECURITY:\n{code_task.result}\n")
         
@@ -4701,49 +3870,29 @@ OUTPUT YOUR COMPLETE REVISED CODE BELOW:
         if "reviewer_number" in task.metadata:
             message_parts.append(f"\nYou are reviewer #{task.metadata['reviewer_number']}")
         
-        # --- FIX FOR TESTER: Provide actual source code, exports, plan, and job spec ---
+        # --- FIX FOR TESTER: Provide actual source filenames ---
+        # --- FIX FOR TESTER: Provide actual source code and exports ---
         if task.task_type == "test_generation":
-            # Include job spec if available
-            job_spec = self.state["context"].get("job_spec") or self.state["context"].get("job_scope", "")
-            if job_spec:
-                message_parts.append("\n" + "=" * 70)
-                message_parts.append("PROJECT REQUIREMENTS (job spec)")
-                message_parts.append("=" * 70)
-                message_parts.append(job_spec[:4000])
-
-            # Include plan YAML if available (for file structure reference)
-            plan_yaml = (
-                self.state["context"].get("final_plan") or
-                self.state["context"].get("architecture_plan") or
-                ""
-            )
-            if plan_yaml:
-                message_parts.append("\n" + "=" * 70)
-                message_parts.append("ARCHITECTURE PLAN (for file structure reference)")
-                message_parts.append("=" * 70)
-                message_parts.append(plan_yaml[:4000])
-
-            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan")), None)
+            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution")), None)
             if code_task and code_task.result:
                 files_dict = self._parse_multi_file_output(code_task.result)
                 project_name = self.state["project_info"].get("project_name", "project")
-
+                
                 message_parts.append("\n" + "=" * 70)
                 message_parts.append("CRITICAL: ACTUAL SOURCE CODE TO TEST")
                 message_parts.append("=" * 70)
-
+                
                 if files_dict:
                     py_files = [f for f in files_dict.keys() if f.endswith('.py')]
                     message_parts.append(f"\nSource files: {', '.join(py_files)}")
-
+                    
                     # Provide actual exports for each file
                     message_parts.append("\n### ACTUAL EXPORTS BY FILE ###")
                     for fname in py_files:
                         content = files_dict[fname]
                         exports = self._extract_exports_from_code(content)
 
-                        # Map file path -> python import module
-                        module_path = fname.replace("\\", "/").replace(".py", "").lstrip("./")
+                        module_path = fname.replace("\\", "/").replace(".py", "")
                         if module_path.startswith("src/"):
                             module_path = module_path[len("src/"):]
                         module_path = module_path.replace("/", ".")
@@ -4753,23 +3902,41 @@ OUTPUT YOUR COMPLETE REVISED CODE BELOW:
                         message_parts.append(f"  Import as: from {import_mod} import {', '.join(exports) if exports else 'N/A'}")
                         message_parts.append(f"  Exports: {exports}")
 
+
+                        # Map file path -> python import module, assuming all sources live under project_root/src/
+                        module_path = fname.replace("\\", "/").replace(".py", "").lstrip("./")
+
+                        # If the file key already includes 'src/', strip it; otherwise assume it's under src/
+                        if module_path.startswith("src/"):
+                            module_path = module_path[len("src/"):]
+
+                        module_path = module_path.replace("/", ".")
+                        import_mod = f"src.{module_path}"
+
+                        message_parts.append(
+                            f"  Import as: from {import_mod} import {', '.join(exports) if exports else 'N/A'}"
+                        )
+
+                    
                     # Include actual code for key files (main.py, services, etc.)
                     message_parts.append("\n### ACTUAL SOURCE CODE ###")
                     priority_files = ['main.py'] + [f for f in py_files if 'service' in f.lower()]
                     other_files = [f for f in py_files if f not in priority_files]
-
+                    
                     for fname in priority_files + other_files:
                         if fname in files_dict:
                             content = files_dict[fname]
+                            # Truncate very long files but show structure
                             if len(content) > 3000:
                                 content = content[:3000] + "\n... (truncated)"
                             message_parts.append(f"\n--- {fname} ---")
                             message_parts.append(content)
                 else:
                     message_parts.append(f"\nSingle source file: {project_name}.py")
+                    # Include the actual code
                     message_parts.append("\n--- Source Code ---")
                     message_parts.append(code_task.result[:5000])
-
+                
                 message_parts.append("\n" + "=" * 70)
                 message_parts.append("IMPORT CORRECTLY: Use the EXACT export names shown above!")
                 message_parts.append("DO NOT invent functions that don't exist!")
@@ -4783,7 +3950,7 @@ OUTPUT YOUR COMPLETE REVISED CODE BELOW:
             message_parts.append("CRITICAL: ACTUAL FILE PATHS FOR DOCUMENTATION")
             message_parts.append("=" * 70)
             
-            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan")), None)
+            code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution")), None)
             if code_task and code_task.result:
                 files_dict = self._parse_multi_file_output(code_task.result)
                 if files_dict:
@@ -4812,24 +3979,9 @@ OUTPUT YOUR COMPLETE REVISED CODE BELOW:
             "completed_at": task.completed_at
         }
     
-        # Store latest code separately — merge revisions into existing code
+        # Store latest code separately
         if task.task_type in ("coding", "revision", "plan_execution", "build_from_plan") and task.result:
-            if task.task_type == "revision" and self.state["context"].get("latest_code"):
-                # Merge: parse both, overlay revision files onto existing
-                existing_files = self._parse_multi_file_output(self.state["context"]["latest_code"])
-                revision_files = self._parse_multi_file_output(task.result)
-                if existing_files and revision_files:
-                    existing_files.update(revision_files)
-                    # Reassemble into ### FILE: format
-                    merged_parts = []
-                    for fname, content in existing_files.items():
-                        merged_parts.append(f"### FILE: {fname} ###\n{content}")
-                    self.state["context"]["latest_code"] = "\n\n".join(merged_parts)
-                else:
-                    # Fallback: just use the revision result as-is
-                    self.state["context"]["latest_code"] = task.result
-            else:
-                self.state["context"]["latest_code"] = task.result
+            self.state["context"]["latest_code"] = task.result
     
         # NEW: Store parsed plan for downstream access
         if task.task_type == "architecture_plan" and task.result:
@@ -4869,7 +4021,7 @@ OUTPUT YOUR COMPLETE REVISED CODE BELOW:
 
         # Get actual code (multi-file output string from coder/plan executor)
         code_task = next(
-            (t for t in self.completed_tasks if t.task_type in ("coding", "revision", "plan_execution", "build_from_plan")),
+            (t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution")),
             None,
         )
         code_content = code_task.result if code_task else ""
@@ -4956,22 +4108,14 @@ Perform final verification:
 
 1. {("Skip - documentation not available" if doc_failed or not readme_content else "Does the README accurately describe the actual code and usage?")}
 2. Are there any integration issues noted above that need fixing?
-3. Review smoke test results. Distinguish between:
-   - Core code failures (import errors, syntax errors in main source) → these are real issues
-   - Test scaffolding failures (test import paths wrong, missing test fixtures) → these are minor/cosmetic
-   Only FAIL for core code issues, not test scaffolding problems.
-4. Does the code implement the requested functionality completely?
+3. Do smoke tests indicate runtime/test failures? If yes: FAIL.
 
 OUTPUT FORMAT (MANDATORY):
 - First non-empty line MUST be exactly one of:
   VERIFICATION: PASS
-  VERIFICATION: WARN
   VERIFICATION: FAIL
-- If WARN, also include: RECOMMENDATION: APPROVE or RECOMMENDATION: REJECT
 - Then provide 3-8 bullet points explaining why.
 
-Use WARN + APPROVE for projects where core code works but tests have minor issues.
-Use FAIL only when the core application code has fundamental problems.
 
 NOTE: {("Documentation generation failed, so focus only on code quality and runtime behavior." if doc_failed else "Verify both documentation and code.")}"""
 

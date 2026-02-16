@@ -87,9 +87,9 @@ class ReviewerAgent(AgentBase):
     """
 
     COMPLIANCE_PROMPT = """You are a code reviewer performing a COMPLIANCE REVIEW.
-You have the architecture plan, the original job specification, AND the generated code.
+You have the architecture plan AND the generated code.
 
-YOUR JOB: Verify the code correctly implements the plan AND satisfies the job specification.
+YOUR JOB: Verify the code correctly implements the plan.
 
 CHECK EACH FILE:
 1. Does each planned file exist in the output?
@@ -97,10 +97,8 @@ CHECK EACH FILE:
 3. Does each file implement ALL requirements from the plan?
 4. Do imports between files resolve correctly?
 5. Does the entry point wire all components together?
-6. Is there real implementation (no stubs, no placeholders, no mock/fake data)?
+6. Is there real implementation (no stubs, no placeholders)?
 7. Will this code actually run without errors?
-8. Does the code meet the acceptance criteria from the job specification?
-9. Are all functional requirements from the job spec addressed?
 
 OUTPUT FORMAT:
 COMPLIANCE REVIEW:
@@ -110,9 +108,6 @@ FILE-BY-FILE:
 
 IMPORT CHECK:
 - [Any import issues found]
-
-JOB SPEC COMPLIANCE:
-- [Check each acceptance criterion and requirement from the job spec]
 
 ISSUES REQUIRING REVISION:
 1. [Specific issue in specific file with what needs to change]
@@ -130,10 +125,9 @@ OVERALL: STATUS: APPROVED | STATUS: NEEDS_REVISION"""
             return self._process_default(input_data)
 
     def _process_compliance(self, input_data: dict) -> dict:
-        """Compliance review — verify code implements the plan and job spec."""
+        """Compliance review — verify code implements the plan."""
         plan_yaml = input_data.get("plan_yaml", "")
         code = input_data.get("code", "")
-        job_spec = input_data.get("job_spec", "")
 
         if not plan_yaml or not code:
             return {"status": "error", "error": "Compliance review requires both plan_yaml and code"}
@@ -144,17 +138,9 @@ OVERALL: STATUS: APPROVED | STATUS: NEEDS_REVISION"""
 ```
 
 GENERATED CODE:
-{code}"""
+{code}
 
-        if job_spec:
-            user_message += f"""
-
-ORIGINAL JOB SPECIFICATION:
-{job_spec}"""
-
-        user_message += """
-
-Perform a compliance review. Check every file against the plan and the job specification."""
+Perform a compliance review. Check every file against the plan."""
 
         messages = [
             {"role": "system", "content": self.COMPLIANCE_PROMPT},
