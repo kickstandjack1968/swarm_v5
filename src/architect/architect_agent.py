@@ -167,19 +167,35 @@ files:
         description: "Holds application configuration"
     needs_from: {}
     requirements:
-      - "Load config from file or environment"
+      - "Load config from file or environment using dataclass with defaults"
+      - "Validate that required paths exist, raise ValueError if not"
 
-  - name: "main.py"
-    purpose: "Entry point"
+  - name: "core/processor.py"
+    purpose: "Data processing pipeline"
     dependencies: ["config.py"]
-    exports: []
+    exports:
+      - name: "Processor"
+        type: "class"
+        description: "Processes input data files"
     needs_from:
       config.py: ["Settings"]
     requirements:
-      - "Parse CLI arguments"
-      - "Initialize and run"
+      - "Read CSV files using csv.DictReader, extract rows matching filter criteria"
+      - "Compute statistics (mean, median, std) using statistics module"
+      - "Write results to JSON using json.dump with indent=2"
 
-execution_order: ["config.py", "main.py"]
+  - name: "main.py"
+    purpose: "Entry point"
+    dependencies: ["config.py", "core/processor.py"]
+    exports: []
+    needs_from:
+      config.py: ["Settings"]
+      "core/processor.py": ["Processor"]
+    requirements:
+      - "Parse CLI arguments with argparse (--input, --output, --config)"
+      - "Initialize Settings and Processor, call processor.run()"
+
+execution_order: ["config.py", "core/processor.py", "main.py"]
 ```
 
 CRITICAL RULES:
@@ -188,6 +204,39 @@ CRITICAL RULES:
 3. dependencies MUST include every file referenced in needs_from
 4. execution_order MUST have dependencies before dependents
 5. Keep it SIMPLE. If it's a simple program, use few files. Don't over-engineer.
+6. Use forward slashes for subdirectory files: "core/processor.py" not "core.processor"
+7. Quote filenames containing slashes in YAML: "core/processor.py"
+
+REQUIREMENTS MUST BE IMPLEMENTATION-SPECIFIC:
+8. Each requirement MUST specify HOW to implement, not just WHAT.
+   BAD:  "Implement document classification"
+   GOOD: "Classify documents by file extension and keyword matching using regex patterns"
+   BAD:  "Use vision-language models for images"
+   GOOD: "Read image files with PIL, extract text with pytesseract OCR, classify by keywords in extracted text"
+   BAD:  "Store data in database"
+   GOOD: "Store records in SQLite using sqlite3 module with tables for documents(id, path, hash, status)"
+9. Requirements must reference specific Python stdlib or common libraries (requests, sqlite3, re, json, csv, pathlib, etc.)
+10. If a feature requires an external API or ML model that may not be available, the requirement MUST specify a working fallback using stdlib.
+    Example: "Classify documents using LLM if available, otherwise use keyword-matching rules with regex"
+
+INTERFACE CONTRACTS (CRITICAL — prevents cross-file mismatches):
+11. Config/settings/dataclass files MUST list ALL their fields in the requirements.
+    BAD:  "Load config from environment using dataclass with defaults"
+    GOOD: "Dataclass with fields: log_directories (list[str]), max_file_size (int, default 10485760), encoding (str, default 'utf-8'), output_dir (Path, default ~/.eve/logs)"
+12. If downstream files need specific attributes from a class, those attributes MUST be declared in that class's requirements.
+    Think: what fields/methods will other files actually call on this class? List them ALL.
+13. The exports description MUST mention key methods WITH RETURN TYPES when other files depend on them.
+    BAD:  description: "Parses log files"
+    GOOD: description: "Parses log files. Methods: parse_file(path) -> list[dict], discover(dirs) -> list[Path]"
+14. RETURN TYPES ARE CRITICAL. Every method mentioned in requirements or exports MUST specify what it returns.
+    BAD:  "Implement get_summary method for generating text summary"
+    GOOD: "get_summary() -> str: returns plain English summary of findings"
+    BAD:  "Return categorized list of log files"
+    GOOD: "discover_logs() -> list[dict]: returns list of dicts with keys: path (str), size (int), type (str)"
+15. Methods that mutate state in-place MUST say so explicitly. Do NOT let downstream files guess.
+    BAD:  "detect_patterns method to find anomalies"
+    GOOD: "detect_patterns() -> list[dict]: returns list of detected anomaly dicts with keys: type, description, severity"
+    (NOT: "detect_patterns() modifies self.anomalies in-place, returns None" — prefer returning data)
 
 Output ONLY the YAML."""
 
@@ -200,7 +249,12 @@ RULES:
 2. If the coder suggests structural changes, adopt them if reasonable
 3. If you disagree with the coder, explain why in a YAML comment
 4. The plan must still use the same YAML format (with needs_from, NOT imports_from)
-5. Output the COMPLETE revised YAML plan"""
+5. Output the COMPLETE revised YAML plan
+6. Config/settings/dataclass files MUST list ALL their fields in requirements
+   Example: "Dataclass with fields: log_dirs (list[str]), max_file_size (int, default 10MB), encoding (str, default 'utf-8')"
+7. Every class export description should mention key methods and their parameter signatures
+   Example: description: "Parses logs. Methods: parse_file(path) -> list[dict], discover(dirs) -> list[Path]"
+8. Cross-check: for each file's requirements, verify that every attribute/method it needs from dependencies is actually declared in those dependencies' requirements"""
     
     def process(self, input_data: dict) -> dict:
         """Generate YAML execution plan."""
@@ -303,6 +357,19 @@ Revise the plan based on the coder's feedback. Output the COMPLETE revised YAML 
 
         try:
             plan = yaml.safe_load(yaml_str)
+        except yaml.YAMLError:
+            yaml_str = self._repair_yaml(yaml_str)
+            try:
+                plan = yaml.safe_load(yaml_str)
+            except yaml.YAMLError as e:
+                return {
+                    "status": "error",
+                    "ok": False,
+                    "error": f"YAML parse error: {e}",
+                    "extracted_yaml": yaml_str
+                }
+
+        try:
             self._validate_plan(plan)
             normalized = yaml.dump(plan, default_flow_style=False, sort_keys=False)
 
@@ -312,14 +379,6 @@ Revise the plan based on the coder's feedback. Output the COMPLETE revised YAML 
                 "result": normalized,
                 "plan_yaml": normalized,
                 "raw_response": response
-            }
-
-        except yaml.YAMLError as e:
-            return {
-                "status": "error",
-                "ok": False,
-                "error": f"YAML parse error: {e}",
-                "extracted_yaml": yaml_str
             }
         except ValueError as e:
             return {
@@ -346,7 +405,68 @@ Revise the plan based on the coder's feedback. Output the COMPLETE revised YAML 
             return response.strip()
         
         return ""
-    
+
+    @staticmethod
+    def _repair_yaml(yaml_str: str) -> str:
+        """Fix common YAML issues from LLM output.
+
+        Handles:
+        - Unquoted values containing colons (Python type hints, method sigs)
+        - Unquoted values containing ``->``
+        - Bare list items with embedded colons
+        """
+        repaired_lines = []
+        for line in yaml_str.split("\n"):
+            stripped = line.lstrip()
+            indent = line[:len(line) - len(stripped)]
+
+            # Skip comments, blank lines, block scalars
+            if not stripped or stripped.startswith("#") or stripped.startswith("|") or stripped.startswith(">"):
+                repaired_lines.append(line)
+                continue
+
+            # Handle list items: "  - some value with: colon"
+            list_prefix = ""
+            working = stripped
+            if stripped.startswith("- "):
+                list_prefix = "- "
+                working = stripped[2:]
+
+            # Try to match a YAML key: value pair
+            m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*:\s?(.*)', working)
+            if m:
+                key, value = m.group(1), m.group(2)
+
+                # If value is empty, already quoted, or a YAML token, skip
+                if not value or value.startswith(("'", '"', "[", "{", "&", "*")):
+                    repaired_lines.append(line)
+                    continue
+
+                # Value contains colon or arrow — needs quoting
+                if ":" in value or "->" in value:
+                    safe_value = value.replace("'", "''")
+                    repaired_lines.append(f"{indent}{list_prefix}{key}: '{safe_value}'")
+                else:
+                    repaired_lines.append(line)
+
+            elif list_prefix and working:
+                # Bare list item (no key: value structure)
+                # Already quoted? skip
+                if working.startswith(("'", '"')):
+                    repaired_lines.append(line)
+                    continue
+
+                # Contains ": " or "->" — quote the whole value
+                if ": " in working or "->" in working:
+                    safe_value = working.replace("'", "''")
+                    repaired_lines.append(f"{indent}- '{safe_value}'")
+                else:
+                    repaired_lines.append(line)
+            else:
+                repaired_lines.append(line)
+
+        return "\n".join(repaired_lines)
+
     def _validate_plan(self, plan: dict):
         """Validate plan structure and consistency."""
         

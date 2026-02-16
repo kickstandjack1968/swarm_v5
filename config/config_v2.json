@@ -85,12 +85,40 @@
           "api_type": "openai",
           "timeout": 7200
         },
+      "coder_2": {
+          "url": "http://localhost:11434/v1",
+          "model": "deepseek-coder-v2:16b",
+          "model_name": "Ollama deepseek-coder-v2:16b (Coder 2)",
+          "api_type": "ollama",
+          "timeout": 7200
+        },
+      "coder_3": {
+          "url": "http://localhost:11434/v1",
+          "model": "devstral:24b",
+          "model_name": "Ollama devstral:24b (Coder 3)",
+          "api_type": "ollama",
+          "timeout": 7200
+        },
+      "coder_4": {
+          "url": "http://localhost:1234/v1",
+          "model": "qwen2.5-coder-32b-instruct@q8_0",
+          "model_name": "LM Studio qwen2.5-coder-32b-instruct q8 (Coder 4)",
+          "api_type": "openai",
+          "timeout": 7200
+        },
       "arbitrator": {
         "url": "http://localhost:1234/v1",
-        "model": "qwen2.5-coder-7b-instruct",
+        "model": "qwen2.5-coder:7b",
         "model_name": "qwen2.5-coder-7b-instruct (Arbitrator)",
         "api_type": "openai",
         "timeout": 7200
+      },
+      "toolsmith": {
+        "url": "http://localhost:1234/v1",
+        "model": "qwen/qwen3-coder-30b",
+        "model_name": "LM Studio qwen/qwen3-coder-30b (Toolsmith)",
+        "api_type": "openai",
+        "timeout": 300
       }
     }
   },
@@ -101,8 +129,23 @@
       "top_p": 0.85
     },    
     "fallback_coder": {
-      "temperature": 0.7,
-      "max_tokens": 25000,
+      "temperature": 0.4,
+      "max_tokens": 35000,
+      "top_p": 0.85
+    },
+    "coder_2": {
+      "temperature": 0.3,
+      "max_tokens": 35000,
+      "top_p": 0.85
+    },
+    "coder_3": {
+      "temperature": 0.2,
+      "max_tokens": 35000,
+      "top_p": 0.85
+    },
+    "coder_4": {
+      "temperature": 0.3,
+      "max_tokens": 35000,
       "top_p": 0.85
     },
     "clarifier": {
@@ -111,19 +154,19 @@
       "top_p": 0.9
     },
     "coder": {
-      "temperature": 0.2,
-      "max_tokens": 25000,
+      "temperature": 0.3,
+      "max_tokens": 35000,
       "top_p": 0.85
     },
     "reviewer": {
-      "temperature": 0.8,
-      "max_tokens": 25000,
+      "temperature": 0.7,
+      "max_tokens": 35000,
       "top_p": 0.95,
       "adversarial_mode": true
     },
     "tester": {
-      "temperature": 0.7,
-      "max_tokens": 25000,
+      "temperature": 0.4,
+      "max_tokens": 35000,
       "top_p": 0.9
     },
     "optimizer": {
@@ -153,6 +196,11 @@
     },
     "arbitrator": {
       "temperature": 0.25,
+      "max_tokens": 4000,
+      "top_p": 0.85
+    },
+    "toolsmith": {
+      "temperature": 0.3,
       "max_tokens": 4000,
       "top_p": 0.85
     }
