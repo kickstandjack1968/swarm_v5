@@ -124,14 +124,12 @@ The plan tells you WHAT to build. You decide HOW to implement it.
 RULES:
 1. Create ALL files listed in the plan
 2. Each file MUST export what the plan specifies in its exports
-3. YOU decide import style — use simple, working Python imports
-4. For files in the same directory: use "from module import X" (absolute)
-5. For files in subdirectories: use appropriate package imports
-6. Implement ALL requirements listed for each file
-7. NO stubs, NO placeholders (pass, ..., NotImplementedError)
-8. Code must be immediately runnable
-9. Include __init__.py files where needed for packages
-10. Include requirements.txt if external packages are used
+3. IMPORTS ARE MANDATORY — copy them exactly from the plan's imports_from section. The import paths shown in the plan are the ONLY valid way to import project files. Do NOT invent your own import paths.
+4. Implement ALL requirements listed for each file
+5. NO stubs, NO placeholders (pass, ..., NotImplementedError)
+6. Code must be immediately runnable
+7. Include __init__.py files where needed for packages
+8. Include requirements.txt if external packages are used
 
 OUTPUT FORMAT:
 ### FILE: filename.py ###

@@ -20,6 +20,7 @@ FIXES APPLIED:
 - Added user_request to all downstream contexts
 """
 
+import ast
 import json
 import os
 import time
@@ -33,6 +34,7 @@ from threading import Lock
 import re
 import subprocess
 import sys
+import yaml
 
 
 # Plan Executor integration
@@ -1382,7 +1384,81 @@ PROJECT STRUCTURE
         
         return len(issues) == 0, issues
 
-    
+    def _check_imports_against_plan(self, code_output: str, plan_yaml: str) -> List[str]:
+        """Check that imports in generated code match the plan's imports_from specs."""
+        errors = []
+        try:
+            plan = yaml.safe_load(plan_yaml) if isinstance(plan_yaml, str) else plan_yaml
+        except Exception:
+            return errors
+
+        if not isinstance(plan, dict):
+            return errors
+
+        # Build map: filename -> {source_file: [names]}
+        plan_imports = {}
+        for file_spec in plan.get('files', []):
+            fname = file_spec.get('name', '')
+            imports_from = file_spec.get('imports_from', {})
+            if imports_from:
+                plan_imports[fname] = imports_from
+
+        if not plan_imports:
+            return errors
+
+        # Parse coder output into files
+        actual_files = self._parse_multi_file_output(code_output)
+        if not actual_files:
+            return errors
+
+        # Build set of all plan filenames for resolution
+        all_plan_files = {f.get('name', '') for f in plan.get('files', [])}
+
+        for filename, expected_imports in plan_imports.items():
+            if filename not in actual_files:
+                continue
+
+            content = actual_files[filename]
+            try:
+                tree = ast.parse(content)
+            except SyntaxError:
+                continue
+
+            # Build set of modules actually imported
+            actual_import_modules = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    actual_import_modules.add(node.module.lstrip('.'))
+
+            # Check each expected import source is referenced
+            for source_file, names in expected_imports.items():
+                source_module = source_file.replace('.py', '').replace('/', '.')
+                source_base = source_file.replace('.py', '').split('/')[-1]
+
+                found = any(
+                    m == source_module or m == source_base or m.endswith('.' + source_base)
+                    for m in actual_import_modules
+                )
+                if not found:
+                    errors.append(
+                        f"{filename}: plan requires importing {names} from "
+                        f"'{source_file}', but no matching import found"
+                    )
+
+            # Check for relative imports that go beyond project root
+            file_parts = filename.replace('\\', '/').split('/')
+            file_depth = len(file_parts) - 1
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.level and node.level > 0:
+                    if node.level > file_depth + 1:
+                        errors.append(
+                            f"{filename}: 'from {'.' * node.level}{node.module or ''}' "
+                            f"goes {node.level} levels up but file is only "
+                            f"{file_depth} level(s) deep"
+                        )
+
+        return errors
+
     def _extract_expected_files(self, architect_result: str) -> set:
         """Extract expected file names from architect's design"""
         files = set()
@@ -2016,7 +2092,28 @@ PROJECT STRUCTURE
                     result_text = output.get("result", "")
                     result_text = self._clean_code_output(result_text)
 
-                    # NOTE: We do NOT call _fix_relative_imports — the coder owns imports
+                    # Validate imports against plan before accepting
+                    import_errors = self._check_imports_against_plan(result_text, final_plan)
+                    if import_errors:
+                        print(f"  ⚠ Import violations found ({len(import_errors)}), requesting fix...")
+                        fix_prompt = (
+                            "The following import errors were found in your code:\n"
+                            + "\n".join(f"  - {e}" for e in import_errors)
+                            + "\n\nFix ONLY the import statements to match the plan's imports_from section. "
+                            "Output ALL files again with corrected imports."
+                        )
+                        fix_payload = dict(payload)
+                        fix_payload["job_spec"] = fix_prompt + "\n\nOriginal plan:\n" + final_plan
+                        try:
+                            fix_output = self._run_external_agent("coder", fix_payload)
+                            if fix_output.get("status") != "error":
+                                fixed_text = self._clean_code_output(fix_output.get("result", ""))
+                                if fixed_text:
+                                    result_text = fixed_text
+                                    print(f"  ✓ Imports fixed ({len(result_text)} chars)")
+                        except Exception as fix_err:
+                            print(f"  ⚠ Import fix pass failed: {fix_err}")
+
                     self.state["context"]["latest_code"] = result_text
                     task.result = result_text
                     task.status = TaskStatus.COMPLETED
