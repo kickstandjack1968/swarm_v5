@@ -1081,57 +1081,109 @@ You MUST fix this issue. The plan requires specific exports.
         context: Dict[str, Any],
         user_request: str
     ) -> FileResult:
-        """Handle revision when plan compliance fails."""
-        
+        """Handle revision when plan compliance fails - cycles through different coders."""
+
         from swarm_coordinator_v2 import AgentRole
-        
+
+        # Define coder sequence - each gets a try with different "thinking style"
+        coder_sequence = [
+            AgentRole.CODER,           # qwen3-coder:30b - Main workhorse
+            AgentRole.FALLBACK_CODER,  # qwen2.5-coder:32b - Proven alternative
+            "coder_2",                 # wizardcoder:33b - Code specialist
+            "coder_3",                 # codellama:34b - Reliable
+            "coder_4",                 # deepseek-coder-33b - Different perspective
+        ]
+
         for attempt in range(self.max_file_revisions):
-            self.logger.info(f"Revision attempt {attempt + 1}/{self.max_file_revisions} for {file_spec.name}")
-            
-            # Build revision prompt with plan context
-            system_prompt = """You are an expert programmer REVISING code to match a plan.
+            # Pick coder for this attempt
+            coder_idx = min(attempt, len(coder_sequence) - 1)
+            role = coder_sequence[coder_idx]
 
-The previous code was REJECTED because it doesn't match the required plan.
-You MUST fix the issues listed below.
+            self.logger.info(f"Revision attempt {attempt + 1}/{self.max_file_revisions} for {file_spec.name} using {role}")
 
-OUTPUT RULES:
-1. Output ONLY valid, executable Python code
-2. NO markdown code blocks
-3. Fix ALL issues mentioned
-4. Keep working parts of the original code"""
-            
-            # Include plan requirements in revision prompt
+            # Categorize issues for targeted fixes
+            issues = result.plan_compliance.get('issues', [])
+            syntax_issues = [i for i in issues if i.startswith('Syntax:')]
+            export_issues = [i for i in issues if 'export' in i.lower() or 'missing class' in i.lower()]
+            stub_issues = [i for i in issues if 'stub' in i.lower() or 'placeholder' in i.lower()]
+            other_issues = [i for i in issues if i not in syntax_issues + export_issues + stub_issues]
+
+            # Build FOCUSED revision prompt
+            system_prompt = f"""You are an expert programmer REVISING code. The previous attempt by another coder was REJECTED.
+
+YOUR TASK: Fix ONLY the specific issues listed. Don't rewrite everything - fix what's broken.
+
+CRITICAL RULES:
+1. Output ONLY valid, executable Python code (no markdown, no explanations)
+2. Fix ALL listed issues
+3. Keep working code - only change what needs fixing
+4. Use the EXACT imports and exports specified in the plan"""
+
+            # Build targeted user message
             mandatory_exports = self._generate_mandatory_exports(file_spec)
             import_block = self._generate_import_block(file_spec)
-            
-            user_message = f"""REVISE THIS FILE: {file_spec.name}
 
-COMPLIANCE FAILURES (MUST FIX):
-{chr(10).join('- ' + i for i in result.plan_compliance.get('issues', []))}
+            user_message = f"""FILE: {file_spec.name}
 
-{mandatory_exports}
+WHAT'S WRONG (fix these):
+"""
 
-REQUIRED IMPORTS (copy exactly):
-{import_block if import_block else "(no imports required)"}
+            # Add categorized issues with specific guidance
+            if syntax_issues:
+                user_message += f"\n🔴 SYNTAX ERRORS:\n" + '\n'.join(f"  - {i}" for i in syntax_issues)
+                user_message += "\n  → Fix: Check parentheses, brackets, indentation, colons\n"
 
-ORIGINAL CODE (with errors):
-{result.content}
+            if export_issues:
+                user_message += f"\n🔴 MISSING/WRONG EXPORTS:\n" + '\n'.join(f"  - {i}" for i in export_issues)
+                user_message += f"\n  → Fix: Add these exports:\n{mandatory_exports}\n"
 
-Output the COMPLETE fixed code:"""
-            
+            if stub_issues:
+                user_message += f"\n🔴 STUB/PLACEHOLDER CODE:\n" + '\n'.join(f"  - {i}" for i in stub_issues)
+                user_message += "\n  → Fix: Replace stubs with real implementation (no 'pass', no hardcoded returns)\n"
+
+            if other_issues:
+                user_message += f"\n🔴 OTHER ISSUES:\n" + '\n'.join(f"  - {i}" for i in other_issues)
+
+            # Add plan requirements
+            user_message += f"\n\n{'='*60}\nREQUIRED IMPORTS (use exactly these):\n{'='*60}\n"
+            user_message += import_block if import_block else "(no imports required)"
+
+            user_message += f"\n\n{'='*60}\nPLAN REQUIREMENTS:\n{'='*60}\n"
+            user_message += f"Purpose: {file_spec.purpose}\n"
+            if file_spec.requirements:
+                user_message += "Must implement:\n" + '\n'.join(f"  - {r}" for r in file_spec.requirements[:5])  # Top 5 only
+
+            # Code handling - smart truncation
+            code_lines = result.content.split('\n')
+            if len(code_lines) > 100:
+                # File is large - show structure only
+                user_message += f"\n\n{'='*60}\nCURRENT CODE STRUCTURE ({len(code_lines)} lines):\n{'='*60}\n"
+                # Show imports, class/function definitions only
+                structure_lines = []
+                for line in code_lines:
+                    stripped = line.strip()
+                    if stripped.startswith(('import ', 'from ', 'class ', 'def ', '@')):
+                        structure_lines.append(line)
+                user_message += '\n'.join(structure_lines[:50])  # Max 50 lines of structure
+                user_message += f"\n\n[... rest of {len(code_lines)} lines omitted - fix issues above and regenerate full code ...]"
+            else:
+                # Small file - show everything
+                user_message += f"\n\n{'='*60}\nCURRENT CODE (with errors):\n{'='*60}\n"
+                user_message += result.content
+
+            user_message += f"\n\n{'='*60}\nYOUR OUTPUT:\n{'='*60}\n"
+            user_message += "Output the COMPLETE fixed code (all functions, all logic):"
+
             try:
-                # Use fallback coder on later attempts
-                role = AgentRole.CODER if attempt == 0 else AgentRole.FALLBACK_CODER
-                
                 response = self.executor.execute_agent(
                     role=role,
                     system_prompt=system_prompt,
                     user_message=user_message
                 )
-                
+
                 content = self._clean_code_output(response, file_spec.name)
                 actual_exports = self._extract_exports(content)
-                
+
                 revised_result = FileResult(
                     name=file_spec.name,
                     content=content,
@@ -1139,23 +1191,25 @@ Output the COMPLETE fixed code:"""
                     status=FileStatus.COMPLETED,
                     revision_count=attempt + 1
                 )
-                
+
                 # Re-verify
                 compliance = self._verify_plan_compliance(file_spec, revised_result, context)
                 revised_result.plan_compliance = compliance
-                
+
                 if compliance['passed']:
-                    self.logger.info(f"Revision successful for {file_spec.name}")
+                    self.logger.info(f"✓ Revision successful for {file_spec.name} using {role}")
                     return revised_result
-                
+                else:
+                    self.logger.warning(f"✗ Revision attempt {attempt + 1} failed with {role}, trying next coder...")
+
                 result = revised_result
-                
+
             except Exception as e:
-                self.logger.error(f"Revision failed: {e}")
-        
+                self.logger.error(f"Revision attempt {attempt + 1} crashed: {e}")
+
         # All revisions failed
         result.status = FileStatus.FAILED
-        result.notes = f"Failed after {self.max_file_revisions} revision attempts"
+        result.notes = f"Failed after {self.max_file_revisions} revision attempts with {len(coder_sequence)} different coders"
         return result
     
     # =========================================================================
