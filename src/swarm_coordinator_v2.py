@@ -1274,16 +1274,57 @@ PROJECT STRUCTURE
         return '\n'.join(signatures)
 
     def _clean_file_content(self, content: str) -> str:
-        """Clean individual file content from markdown artifacts"""
+        """Clean individual file content from markdown artifacts
+
+        Extracts code from markdown code blocks if present, stopping at commentary.
+        If no code blocks, returns content up to first documentation section.
+        """
         lines = content.split('\n')
+
+        # Check if content contains markdown code blocks
+        code_block_start = None
+        code_block_end = None
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('```'):
+                if code_block_start is None:
+                    # Found start of first code block
+                    code_block_start = i
+                else:
+                    # Found end of first code block
+                    code_block_end = i
+                    break
+
+        # If we found a complete code block, extract only that
+        if code_block_start is not None and code_block_end is not None:
+            # Extract lines between the markers
+            code_lines = lines[code_block_start + 1:code_block_end]
+            return '\n'.join(code_lines).strip()
+
+        # If we found a start but no end, extract from start to end of content
+        if code_block_start is not None and code_block_end is None:
+            code_lines = lines[code_block_start + 1:]
+            return '\n'.join(code_lines).strip()
+
+        # No code blocks found - check for markdown headers that indicate commentary
+        # and stop before them
         cleaned = []
-        
         for line in lines:
-            # Skip markdown code block markers
-            if line.strip().startswith('```'):
-                continue
+            stripped = line.strip()
+            # Stop at markdown headers (except our FILE markers which shouldn't appear here)
+            if stripped.startswith('###') and 'FILE:' not in stripped:
+                break
+            # Stop at common documentation section headers
+            if stripped.startswith('## ') or (stripped.startswith('### ') and any(
+                keyword in stripped.upper() for keyword in [
+                    'RATIONALE', 'HOW TO', 'EXPECTED', 'DESIGN',
+                    'NOTES', 'EXAMPLE', 'USAGE', 'TEST', 'REQUIREMENTS'
+                ]
+            )):
+                break
             cleaned.append(line)
-        
+
         return '\n'.join(cleaned).strip()
     
     def _verify_coder_files_v2(self, architect_result: str, coder_result: str) -> tuple:
@@ -3495,30 +3536,53 @@ Return STATUS: NEEDS_REVISION with SPECIFIC bugs/issues if found.
 
 Be thorough - broken code getting through is a critical failure.""",
 
-            AgentRole.TESTER: """You are a test engineer generating EXECUTABLE pytest test code.
+            AgentRole.TESTER: """⚠️ CRITICAL FORMAT REQUIREMENT ⚠️
+Your output will be saved DIRECTLY as a .py file. The FIRST character MUST be 'i' or 'f' (from 'import' or 'from').
 
-🚫 ABSOLUTELY FORBIDDEN - DO NOT OUTPUT:
-1. Directory tree diagrams (tests/ ├── test_foo.py └── test_bar.py)
-2. File structure descriptions
-3. Placeholder text like "# Test implementation here" or "# TODO: add tests"
-4. Markdown code blocks (```python)
-5. Explanations, documentation, or comments about what tests SHOULD exist
-6. Lists of "test files to create" or "test plan"
+🚫 WRONG OUTPUT EXAMPLE (DO NOT DO THIS):
+---
+Here is a test for the calculator:
 
-✅ YOU MUST OUTPUT:
-ACTUAL EXECUTABLE PYTHON CODE that can be saved directly to a .py file and run with pytest.
+### FILE: test_main.py ###
+```python
+import pytest
+from src.main import main
 
-CRITICAL OUTPUT RULES:
-1. Output ONLY raw Python code - START with import statements
-2. NEVER copy source code into test files - always import from the source module
-3. The VERY FIRST LINE must be: import pytest (or another import)
-4. Every test function MUST have actual assertions or 'pass'
-5. NO EMPTY FUNCTIONS without a body
-   WRONG: def test_foo():
-   RIGHT: def test_foo():
-       assert True  # or actual test logic
+def test_main():
+    assert main() == "Hello"
+```
 
-EXAMPLE OF WHAT TO OUTPUT:
+### TEST DESIGN RATIONALE:
+This test verifies...
+---
+
+✅ CORRECT OUTPUT EXAMPLE (DO THIS):
+---
+import pytest
+from src.main import main
+
+def test_main():
+    assert main() == "Hello"
+---
+
+See the difference? WRONG output has preamble text and markdown. CORRECT output starts immediately with 'import'.
+
+═══════════════════════════════════════════════════════════════════════════════
+ABSOLUTE RULES - VIOLATIONS WILL CAUSE SYSTEM FAILURE:
+═══════════════════════════════════════════════════════════════════════════════
+
+1. NO PREAMBLE TEXT - Do NOT write "Here is", "This test", or ANY text before the code
+2. NO MARKDOWN - Do NOT use ```python or ``` or ### FILE: or any markdown formatting
+3. NO EXPLANATIONS - Do NOT add "RATIONALE", "NOTES", "HOW TO RUN", or commentary
+4. NO DIRECTORY TREES - Do NOT show file structures like tests/├── test_foo.py
+5. START WITH IMPORT - First line MUST be: import pytest OR from src.X import Y
+
+If you output ANYTHING except raw Python code, the file will break and tests will fail.
+
+═══════════════════════════════════════════════════════════════════════════════
+WHAT YOUR OUTPUT MUST LOOK LIKE:
+═══════════════════════════════════════════════════════════════════════════════
+
 import pytest
 from src.calculator import add, subtract
 
@@ -3528,62 +3592,51 @@ def test_add_positive_numbers():
 def test_subtract_negative_result():
     assert subtract(3, 5) == -2
 
-EXAMPLE OF WHAT NOT TO OUTPUT (FORBIDDEN):
-tests/
-├── test_calculator.py
-├── test_math.py
-└── test_utils.py
+def test_add_handles_zero():
+    assert add(0, 5) == 5
 
+That's it. Just code. No commentary. No explanations. No markdown.
+
+═══════════════════════════════════════════════════════════════════════════════
 IMPORT RULES:
-- Import the functions you're testing from the ACTUAL source modules provided in context
-- Use the EXACT function/class names shown in the exports list - do not invent names
-- For nested modules like models/asset.py, import as: from models.asset import Asset
-- NEVER redefine or copy the functions being tested
-- The project source code is located in a 'src' directory.
-- ALWAYS prefix your imports with 'src.'.
-- Example: If testing 'main.py', import as 'from src.main import main'
-- Example: If testing 'utils.py', import as 'from src.utils import helper'
-- NEVER import directly like 'from main import main' - this will fail.
+═══════════════════════════════════════════════════════════════════════════════
 
-STRUCTURE:
-- Start with imports: pytest, unittest.mock, then the source modules
-- Use pytest fixtures for common setup (mock configs, temp files, temp databases)
-- Group related tests in classes if appropriate
-- Ensure every test function has a body (assertions or pass)
+- Source code is in 'src/' directory - ALWAYS use: from src.MODULE import FUNCTION
+- Example: Testing main.py → from src.main import main
+- Example: Testing utils.py → from src.utils import helper_function
+- Use EXACT names from the exports list provided in context - do NOT invent function names
+- NEVER copy/paste source code into tests - import it
 
-TEST COVERAGE REQUIREMENTS:
-- Unit tests for each public function/method listed in the exports
-- Edge cases: None, empty strings, empty collections, boundary values
-- Error conditions: missing files, invalid input, malformed data
-- For database operations: use temporary databases or mock the connection
+═══════════════════════════════════════════════════════════════════════════════
+TEST REQUIREMENTS:
+═══════════════════════════════════════════════════════════════════════════════
 
-MOCKING GUIDELINES:
-- Use unittest.mock.patch for external dependencies (file I/O, datetime, etc.)
-- Use mock_open for file operations
-- Mock database connections to avoid side effects
-- When testing CLI, mock sys.argv
-- When mocking datetime, patch it where it's used: @patch('module.datetime')
+- Test each public function/class listed in exports
+- Include edge cases: None, empty strings, empty lists, boundary values
+- Include error cases: invalid input, missing files, malformed data
+- Every test function needs assertions or 'pass' - NO empty functions
+- Use unittest.mock for file I/O, network calls, datetime, random, etc.
+- For databases: use temp databases or mock connections
 
-REGEX AND CONFIG TESTING:
-- NEVER assert exact string equality on regex patterns from config files
-- String escaping differs between YAML parsing and Python literals
-- Instead, test that regex patterns WORK correctly:
-  WRONG: assert config['regex'] == "\\\\bERROR\\\\b"
-  RIGHT: assert re.search(config['regex'], "ERROR occurred") is not None
-  RIGHT: assert re.search(config['regex'], "ERRORS") is None  # word boundary works
-- For config values, test behavior not exact string representation
-- If testing config loading, verify the loaded config can be USED correctly
+NAMING: test_<function>_<scenario>
+Example: test_calculate_total_with_empty_list
 
-NAMING:
-- test_<function_name>_<scenario>
-- Example: test_create_asset_valid_name, test_create_asset_empty_name_raises
+═══════════════════════════════════════════════════════════════════════════════
+PRE-SUBMISSION CHECKLIST - VERIFY BEFORE RESPONDING:
+═══════════════════════════════════════════════════════════════════════════════
 
-FINAL REMINDER:
-Your output will be saved DIRECTLY to a file called test_*.py
-The FIRST character of your output must be 'i' (from 'import')
-If your output starts with ANYTHING ELSE (tests/, #, ```, etc.), it's WRONG.
+☐ First character is 'i' or 'f' (from import/from)
+☐ No text before the first import statement
+☐ No ``` or ```python anywhere
+☐ No ### FILE: headers
+☐ No explanation sections (RATIONALE, NOTES, etc.)
+☐ All imports use 'from src.X import Y' format
+☐ Every test function has a body (not empty)
+☐ Output is valid Python that can run with pytest
 
-OUTPUT: Raw executable Python code ONLY. Start with imports. No preamble. No markdown. No directory trees.""",
+If ANY checkbox is unchecked, FIX YOUR OUTPUT before submitting.
+
+NOW OUTPUT ONLY THE RAW PYTHON TEST CODE - START WITH 'import' OR 'from':""",
 
             AgentRole.OPTIMIZER: """You are a performance optimization expert.
 
