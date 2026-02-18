@@ -705,9 +705,11 @@ Output the COMPLETE revised YAML plan:"""
                         # Strip generics: list[T] → list, Optional[T] → Optional
                         base_type = _re.sub(r'\[.*', '', type_part).strip()
                         base_type = base_type.lstrip('*').strip()
-                        if (base_type and base_type not in PRIMITIVES
-                                and base_type not in own_exports
-                                and base_type not in importable_types):
+                        # Strip dotted module prefix: pathlib.Path → Path, datetime.datetime → datetime
+                        leaf_type = base_type.rsplit('.', 1)[-1] if '.' in base_type else base_type
+                        if (base_type and leaf_type not in PRIMITIVES
+                                and base_type not in own_exports and leaf_type not in own_exports
+                                and base_type not in importable_types and leaf_type not in importable_types):
                             raise ValueError(
                                 f"File '{name}' method '{exp.get('name','?')}.{method_name}' "
                                 f"parameter '{arg_str}' uses type '{base_type}', but '{base_type}' "
