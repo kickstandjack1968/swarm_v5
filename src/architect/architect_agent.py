@@ -479,7 +479,18 @@ Output the COMPLETE revised YAML plan:"""
         - Unquoted values containing colons (Python type hints, method sigs)
         - Unquoted values containing ``->``
         - Bare list items with embedded colons
+        - Orphaned aliases (*idNNN) without anchor definitions
         """
+        import re as _re
+
+        # Resolve anchors/aliases: collect defined anchors, then replace any
+        # orphaned *idNNN aliases (no matching &idNNN) with {} so YAML parses.
+        defined_anchors = set(_re.findall(r'&(id\d+)', yaml_str))
+        used_aliases = set(_re.findall(r'\*(id\d+)', yaml_str))
+        orphaned = used_aliases - defined_anchors
+        for alias in orphaned:
+            yaml_str = _re.sub(r'\*' + alias + r'\b', '{}', yaml_str)
+
         repaired_lines = []
         for line in yaml_str.split("\n"):
             stripped = line.lstrip()
