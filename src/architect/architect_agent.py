@@ -655,10 +655,27 @@ Output the COMPLETE revised YAML plan:"""
         # Validate that non-primitive types in method signatures are declared in needs_from
         # This ensures coders receive dependency code for every type they need to use.
         PRIMITIVES = {
+            # Python builtins
             'str', 'int', 'float', 'bool', 'dict', 'list', 'tuple', 'set', 'bytes',
-            'None', 'Any', 'Optional', 'Union', 'List', 'Dict', 'Tuple', 'Set',
-            'Callable', 'Iterator', 'Generator', 'Type', 'object', 'callable',
-            'self', 'cls', 'T', 'KT', 'VT'
+            'bytearray', 'memoryview', 'complex', 'frozenset', 'None', 'object',
+            # typing module
+            'Any', 'Optional', 'Union', 'List', 'Dict', 'Tuple', 'Set', 'FrozenSet',
+            'Callable', 'Iterator', 'Generator', 'Type', 'ClassVar', 'Final',
+            'Sequence', 'Mapping', 'MutableMapping', 'Iterable', 'IO',
+            # stdlib types commonly used in signatures
+            'Path', 'PurePath', 'PosixPath', 'WindowsPath',  # pathlib
+            'datetime', 'date', 'time', 'timedelta', 'timezone',  # datetime
+            'Enum', 'IntEnum',  # enum
+            'dataclass',  # dataclasses
+            'Pattern', 'Match',  # re
+            'Logger',  # logging
+            'TextIO', 'BinaryIO',  # io
+            'Queue',  # queue
+            'Thread', 'Lock',  # threading
+            'Decimal',  # decimal
+            'UUID',  # uuid
+            # generic type vars
+            'self', 'cls', 'T', 'KT', 'VT', 'S',
         }
         import re as _re
         for f in plan['files']:
