@@ -503,7 +503,30 @@ Output the COMPLETE revised YAML plan:"""
                 key, value = m.group(1), m.group(2)
 
                 # If value is empty, already quoted, or a YAML token, skip
-                if not value or value.startswith(("'", '"', "[", "{", "&", "*")):
+                if not value or value.startswith(("'", '"', "&", "*")):
+                    repaired_lines.append(line)
+                    continue
+
+                # Inline flow sequence: [item1, item2, ...] — quote unquoted items with colons
+                if value.startswith("[") and value.endswith("]"):
+                    inner = value[1:-1]
+                    fixed_items = []
+                    changed = False
+                    for item in inner.split(","):
+                        s = item.strip()
+                        if s and not s.startswith(("'", '"')) and (":" in s or "->" in s):
+                            fixed_items.append(f"'{s.replace(chr(39), chr(39)*2)}'")
+                            changed = True
+                        else:
+                            fixed_items.append(item)
+                    if changed:
+                        repaired_lines.append(f"{indent}{list_prefix}{key}: [{', '.join(i.strip() for i in fixed_items)}]")
+                    else:
+                        repaired_lines.append(line)
+                    continue
+
+                # Skip other block/mapping starts
+                if value.startswith(("{",)):
                     repaired_lines.append(line)
                     continue
 
