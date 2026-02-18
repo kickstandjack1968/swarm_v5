@@ -619,7 +619,9 @@ Output the COMPLETE revised YAML plan:"""
 
             # Check imports_from/needs_from references valid files and exports
             import_map = f.get('imports_from', {}) or f.get('needs_from', {})
-            for source, imports in (import_map or {}).items():
+            if not isinstance(import_map, dict):
+                import_map = {}
+            for source, imports in import_map.items():
                 if source not in file_names:
                     raise ValueError(f"File '{name}' imports from unknown file '{source}'")
                 
@@ -651,8 +653,10 @@ Output the COMPLETE revised YAML plan:"""
         for f in plan['files']:
             name = f['name']
             import_map = f.get('imports_from', {}) or f.get('needs_from', {})
+            if not isinstance(import_map, dict):
+                import_map = {}
             importable_types = set()
-            for src_imports in (import_map or {}).values():
+            for src_imports in import_map.values():
                 if isinstance(src_imports, list):
                     importable_types.update(src_imports)
             own_exports = file_exports.get(name, set())
@@ -660,7 +664,10 @@ Output the COMPLETE revised YAML plan:"""
             for exp in f.get('exports', []):
                 if not isinstance(exp, dict):
                     continue
-                for method_name, method_info in exp.get('methods', {}).items():
+                methods = exp.get('methods', {})
+                if not isinstance(methods, dict):
+                    continue
+                for method_name, method_info in methods.items():
                     if not isinstance(method_info, dict):
                         continue
                     for arg_str in method_info.get('args', []):
