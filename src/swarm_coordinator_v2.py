@@ -37,18 +37,36 @@ import sys
 
 # Plan Executor integration
 try:
-    from plan_executor_v2 import (
-        PlanExecutor, 
+    from .plan_executor_v2 import (
+        PlanExecutor,
         create_planned_workflow,
         execute_plan_task,
         ARCHITECT_PLAN_SYSTEM_PROMPT,
         get_architect_plan_prompt,
-        extract_yaml_from_response
+        extract_yaml_from_response,
+        FileSpec,
+        FileResult,
+        FileStatus
     )
     PLAN_EXECUTOR_AVAILABLE = True
-except ImportError as e:
-    print(f"Import failed: {e}")
-    PLAN_EXECUTOR_AVAILABLE = False
+except ImportError:
+    # Fallback to absolute import for direct script execution
+    try:
+        from plan_executor_v2 import (
+            PlanExecutor,
+            create_planned_workflow,
+            execute_plan_task,
+            ARCHITECT_PLAN_SYSTEM_PROMPT,
+            get_architect_plan_prompt,
+            extract_yaml_from_response,
+            FileSpec,
+            FileResult,
+            FileStatus
+        )
+        PLAN_EXECUTOR_AVAILABLE = True
+    except ImportError as e:
+        print(f"Import failed: {e}")
+        PLAN_EXECUTOR_AVAILABLE = False
 
 
 class DockerSandbox:
@@ -465,9 +483,9 @@ class AgentExecutor:
         self.metrics: Dict[str, AgentMetrics] = {}
         self.metrics_lock = Lock()
         
-    def _get_agent_config(self, role: AgentRole) -> Dict:
+    def _get_agent_config(self, role) -> Dict:
         """Get configuration for specific agent role"""
-        role_str = role.value
+        role_str = role.value if hasattr(role, 'value') else str(role)
         mode = self.config['model_config']['mode']
         
         if mode == 'multi' and role_str in self.config['model_config']['multi_model']:
@@ -553,27 +571,30 @@ class AgentExecutor:
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             raise Exception(f"Invalid API response format: {str(e)}")
     
-    def execute_agent(self, role: AgentRole, system_prompt: str, user_message: str, 
+    def execute_agent(self, role, system_prompt: str, user_message: str,
                       agent_params: Optional[Dict] = None) -> str:
         """Execute a single agent with the given prompts"""
-        
+
+        # Normalize role to string for dict lookups
+        role_str = role.value if hasattr(role, 'value') else str(role)
+
         # Get agent configuration
         agent_config = self._get_agent_config(role)
         url = agent_config['url']
         model = agent_config.get('model', 'local-model')
         api_type = agent_config.get('api_type', 'openai')
         timeout = agent_config.get('timeout', 7200)
-        
+
         # Merge parameters
-        params = self.config.get('agent_parameters', {}).get(role.value, {}).copy()
+        params = self.config.get('agent_parameters', {}).get(role_str, {}).copy()
         if agent_params:
             params.update(agent_params)
-        
+
         # Initialize metrics if needed
-        agent_key = role.value
+        agent_key = role_str
         with self.metrics_lock:
             if agent_key not in self.metrics:
-                self.metrics[agent_key] = AgentMetrics(agent_name=agent_key, role=role.value)
+                self.metrics[agent_key] = AgentMetrics(agent_name=agent_key, role=role_str)
         
         # Execute the call
         start_time = time.time()
@@ -591,7 +612,7 @@ class AgentExecutor:
             return response
             
         except Exception as e:
-            raise Exception(f"Agent {role.value} failed: {str(e)}")
+            raise Exception(f"Agent {role_str} failed: {str(e)}")
             
         finally:
             elapsed = time.time() - start_time
@@ -753,24 +774,16 @@ class SwarmCoordinator:
                     if parent:
                         folders_with_py.add(parent)
         
-        # Generate __init__.py for each
+        # Generate empty __init__.py for each
+        # NOTE: PlanExecutor already generates proper __init__.py with specific imports.
+        # We only create empty ones here to ensure packages are importable.
+        # Using `from .module import *` causes circular imports (e.g. from .main import *).
         for folder in folders_with_py:
             init_path = os.path.join(folder, "__init__.py")
             if not os.path.exists(init_path):
-                # Simple __init__.py with exports
-                py_files = [f for f in os.listdir(folder) 
-                           if f.endswith('.py') and f != '__init__.py']
-                
-                lines = ['"""Auto-generated __init__.py"""', '']
-                
-                # Import from each module
-                for py_file in py_files:
-                    module = py_file[:-3]  # Remove .py
-                    lines.append(f"from .{module} import *")
-                
                 with open(init_path, 'w') as f:
-                    f.write('\n'.join(lines))
-                
+                    f.write('"""Auto-generated __init__.py"""\n')
+
                 print(f"   ✓ Generated: {os.path.relpath(init_path, project_dir)}")
 
 
@@ -963,7 +976,7 @@ PROJECT STRUCTURE
             return
         
         # Save code - handle multi-file output
-        code_task = next((t for t in reversed(self.completed_tasks) if t.task_type in ("coding", "plan_execution", "revision")), None)
+        code_task = next((t for t in reversed(self.completed_tasks) if t.task_type in ("coding", "plan_execution", "revision", "build_from_plan")), None)
         if code_task and code_task.result:
             files_dict = self._parse_multi_file_output(code_task.result)
             
@@ -1273,6 +1286,37 @@ PROJECT STRUCTURE
         
         return '\n'.join(signatures)
 
+    def _validate_tester_output_format(self, output: str) -> tuple:
+        """
+        Validate tester output format compliance.
+        Returns (is_valid: bool, error_message: str)
+        """
+        if not output or not output.strip():
+            return False, "Output is empty"
+
+        stripped = output.strip()
+
+        # Check 1: Must start with import/from
+        if not stripped.startswith(('import ', 'from ')):
+            first_line = stripped.split('\n')[0][:60]
+            return False, f"Output must start with 'import' or 'from', not: '{first_line}'"
+
+        # Check 2: No markdown code blocks
+        if '```' in output:
+            return False, "Output contains forbidden markdown code blocks (```)"
+
+        # Check 3: No preamble text or commentary headers
+        forbidden_phrases = [
+            'here is', "here's", 'test plan', 'rationale',
+            'design', '### file:', 'how to', 'expected output'
+        ]
+        first_100 = stripped[:100].lower()
+        for phrase in forbidden_phrases:
+            if phrase in first_100:
+                return False, f"Output contains forbidden preamble/commentary: '{phrase}'"
+
+        return True, ""  # Valid!
+
     def _clean_file_content(self, content: str) -> str:
         """Clean individual file content from markdown artifacts
 
@@ -1542,7 +1586,9 @@ PROJECT STRUCTURE
         os.makedirs(log_dir, exist_ok=True)
 
         timestamp = datetime.now().strftime("%H%M%S")
-        filename = f"{timestamp}_{agent_name}_{step}.json"
+        # Sanitize step name: replace path separators to avoid creating subdirectories
+        safe_step = step.replace("/", "_").replace("\\", "_")
+        filename = f"{timestamp}_{agent_name}_{safe_step}.json"
 
         log_entry = {
             "step": step,
@@ -1553,7 +1599,7 @@ PROJECT STRUCTURE
             "user_message": payload.get("user_message", ""),
         }
         # Include any extra keys from payload (job_spec, plan_yaml, etc.)
-        for key in ("job_spec", "plan_yaml", "code", "draft_plan", "coder_feedback"):
+        for key in ("job_spec", "plan_yaml", "code", "draft_plan", "coder_feedback", "revision_feedback", "file_code", "plan_spec"):
             if key in payload:
                 log_entry[key] = payload[key]
 
@@ -1564,6 +1610,100 @@ PROJECT STRUCTURE
             print(f"  [LOG] {filename}")
         except Exception as e:
             print(f"  [LOG] Warning: could not save prompt log: {e}")
+
+    def _build_file_plan_spec_string(self, file_spec) -> str:
+        """Convert a FileSpec into a readable plan specification string for the reviewer."""
+        parts = [f"File: {file_spec.name}"]
+        parts.append(f"Purpose: {file_spec.purpose}")
+
+        if file_spec.requirements:
+            parts.append("\nRequirements:")
+            for i, req in enumerate(file_spec.requirements, 1):
+                parts.append(f"  {i}. {req}")
+
+        if file_spec.exports:
+            parts.append("\nRequired Exports:")
+            for exp in file_spec.exports:
+                exp_type = exp.type if hasattr(exp, 'type') else 'unknown'
+                exp_name = exp.name if hasattr(exp, 'name') else str(exp)
+                parts.append(f"  - {exp_name} ({exp_type})")
+
+        if file_spec.imports_from:
+            parts.append("\nImports From:")
+            for source, names in file_spec.imports_from.items():
+                parts.append(f"  - {source}: {', '.join(names)}")
+
+        if file_spec.dependencies:
+            parts.append(f"\nDependencies: {', '.join(file_spec.dependencies)}")
+
+        return "\n".join(parts)
+
+    def _build_dependency_code_for_review(self, file_spec, all_files_dict: Dict[str, str]) -> str:
+        """Build dependency code context for per-file compliance review.
+
+        Direct dependencies get full code (up to 8K each).
+        """
+        if not file_spec.dependencies:
+            return ""
+
+        parts = []
+        for dep_name in file_spec.dependencies:
+            if dep_name in all_files_dict:
+                dep_code = all_files_dict[dep_name]
+                if len(dep_code) <= 8000:
+                    parts.append(f"--- {dep_name} (full code) ---\n{dep_code}")
+                else:
+                    # Use signature extraction for large files
+                    try:
+                        pe = PlanExecutor.__new__(PlanExecutor)
+                        sig = pe._extract_signatures(dep_code)
+                        parts.append(f"--- {dep_name} (signatures, {len(dep_code)} chars total) ---\n{sig}")
+                    except Exception:
+                        parts.append(f"--- {dep_name} (truncated to 4K) ---\n{dep_code[:4000]}")
+
+        return "\n\n".join(parts) if parts else ""
+
+    def _cap_reviewer_issues(self, result_text: str, max_issues: int = 10) -> str:
+        """Cap the number of issues in reviewer output to prevent revision prompt flooding.
+
+        Finds numbered issues (lines matching '^\d+\.') in the ISSUES: section
+        and truncates to max_issues, appending a note about omitted issues.
+        """
+        if not result_text:
+            return result_text
+
+        # Find ISSUES: section
+        issues_match = re.search(r'(ISSUES:\s*\n)(.*?)(\n\n|\Z)', result_text, re.DOTALL | re.IGNORECASE)
+        if not issues_match:
+            return result_text
+
+        issues_section = issues_match.group(2)
+        issue_lines = issues_section.strip().split('\n')
+
+        # Count numbered issues (e.g. "1.", "2.", etc.)
+        numbered_indices = []
+        for i, line in enumerate(issue_lines):
+            if re.match(r'^\s*\d+\.', line):
+                numbered_indices.append(i)
+
+        if len(numbered_indices) <= max_issues:
+            return result_text
+
+        # Find where the (max_issues+1)th issue starts
+        cutoff_idx = numbered_indices[max_issues]
+        kept_lines = issue_lines[:cutoff_idx]
+        omitted = len(numbered_indices) - max_issues
+        kept_lines.append(f"\n[... {omitted} additional issues omitted — fix the above first]")
+
+        # Reconstruct result_text
+        new_issues_section = '\n'.join(kept_lines)
+        new_result = result_text[:issues_match.start(2)] + new_issues_section + (issues_match.group(3) or '')
+        # Append the rest of result_text after the ISSUES section
+        rest_start = issues_match.end()
+        if rest_start < len(result_text):
+            new_result += result_text[rest_start:]
+
+        return new_result
 
     def _run_external_agent(self, role_name: str, payload: Dict) -> Dict:
         """
@@ -1735,10 +1875,20 @@ PROJECT STRUCTURE
     # -------------------------------------------------------------------------
     # UPDATED EXECUTE_TASK
     # -------------------------------------------------------------------------
+    def _diag(self, msg: str):
+        """Append a diagnostic line to /tmp/swarm_diag.log"""
+        try:
+            with open("/tmp/swarm_diag.log", "a") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
+
     def execute_task(self, task: Task) -> Task:
         """Execute a single task"""
         task.status = TaskStatus.IN_PROGRESS
-        
+
+        self._diag(f"execute_task ENTER: task_id={task.task_id} task_type={task.task_type} role={task.assigned_role} role_type={type(task.assigned_role).__name__}")
+
         try:
 # --- PRIORITY 0: PLAN EXECUTION ---
             if task.task_type == "plan_execution":
@@ -1752,41 +1902,63 @@ PROJECT STRUCTURE
             
             # --- COLLABORATIVE WORKFLOW TASK HANDLERS ---
 
-            # DRAFT_PLAN: Architect produces draft plan from job_spec
+            # DRAFT_PLAN: Architect produces draft plan from job_spec (with retry on validation errors)
             if task.task_type == "draft_plan":
                 job_spec = self.state["context"].get("job_spec", "")
                 if not job_spec:
                     job_spec = self.state["context"].get("job_scope", "")
                 architect_config = self.executor._get_agent_config(AgentRole.ARCHITECT)
+                max_retries = self.state.get("max_iterations", 3)
+                validation_error = None
 
-                payload = {
-                    "mode": "draft",
-                    "job_spec": job_spec,
-                    "config": {
-                        "model_url": architect_config.get("url", "http://localhost:1233/v1"),
-                        "model_name": architect_config.get("model", "local-model"),
-                        "api_type": architect_config.get("api_type", "openai"),
-                        "temperature": 0.6,
-                        "max_tokens": 4000,
-                        "timeout": architect_config.get("timeout", 600)
+                for attempt in range(max_retries):
+                    payload = {
+                        "mode": "draft",
+                        "job_spec": job_spec,
+                        "config": {
+                            "model_url": architect_config.get("url", "http://localhost:1233/v1"),
+                            "model_name": architect_config.get("model", "local-model"),
+                            "api_type": architect_config.get("api_type", "openai"),
+                            "temperature": 0.6,
+                            "max_tokens": architect_config.get("max_tokens", 25000),
+                            "timeout": architect_config.get("timeout", 600)
+                        }
                     }
-                }
+                    if validation_error:
+                        payload["validation_error"] = validation_error
 
-                self._log_prompt("DRAFT", "ARCHITECT", {"system_prompt": "DRAFT_PLAN_PROMPT", "user_message": job_spec, "job_spec": job_spec}, mode="draft")
+                    log_step = f"DRAFT_RETRY{attempt}" if attempt > 0 else "DRAFT"
+                    self._log_prompt(log_step, "ARCHITECT", {"system_prompt": "DRAFT_PLAN_PROMPT", "user_message": job_spec, "job_spec": job_spec, "validation_error": validation_error}, mode="draft")
 
-                try:
-                    output = self._run_external_agent("architect", payload)
-                    if output.get("status") == "error":
-                        raise Exception(output.get("error"))
+                    try:
+                        output = self._run_external_agent("architect", payload)
+                        if output.get("status") == "error":
+                            error_msg = output.get("error", "")
+                            # Check if this is a validation error we can retry
+                            if "Validation error" in error_msg and attempt < max_retries - 1:
+                                validation_error = error_msg
+                                print(f"  ⚠ Draft plan validation failed (attempt {attempt + 1}/{max_retries}): {error_msg}")
+                                continue
+                            raise Exception(error_msg)
 
-                    plan_yaml = output.get("plan_yaml") or output.get("result", "")
-                    self.state["context"]["draft_plan"] = plan_yaml
-                    task.result = plan_yaml
-                    task.status = TaskStatus.COMPLETED
-                    print(f"  ✓ Draft plan produced ({len(plan_yaml)} chars)")
-                except Exception as e:
-                    task.status = TaskStatus.FAILED
-                    task.error = str(e)
+                        plan_yaml = output.get("plan_yaml") or output.get("result", "")
+                        self.state["context"]["draft_plan"] = plan_yaml
+                        task.result = plan_yaml
+                        task.status = TaskStatus.COMPLETED
+                        if attempt > 0:
+                            print(f"  ✓ Draft plan produced on retry {attempt + 1} ({len(plan_yaml)} chars)")
+                        else:
+                            print(f"  ✓ Draft plan produced ({len(plan_yaml)} chars)")
+                        break
+                    except Exception as e:
+                        error_msg = str(e)
+                        if "Validation error" in error_msg and attempt < max_retries - 1:
+                            validation_error = error_msg
+                            print(f"  ⚠ Draft plan validation failed (attempt {attempt + 1}/{max_retries}): {error_msg}")
+                            continue
+                        task.status = TaskStatus.FAILED
+                        task.error = error_msg
+                        break
 
                 task.completed_at = time.time()
                 self._update_context(task)
@@ -1805,7 +1977,7 @@ PROJECT STRUCTURE
                         "model_name": coder_config.get("model", "local-model"),
                         "api_type": coder_config.get("api_type", "openai"),
                         "temperature": 0.3,
-                        "max_tokens": 4000,
+                        "max_tokens": coder_config.get("max_tokens", 25000),
                         "timeout": coder_config.get("timeout", 1200)
                     }
                 }
@@ -1830,133 +2002,326 @@ PROJECT STRUCTURE
                 self._update_context(task)
                 return task
 
-            # FINALIZE_PLAN: Architect incorporates coder feedback
+            # FINALIZE_PLAN: Architect incorporates coder feedback (with retry on validation errors)
             if task.task_type == "finalize_plan":
                 draft_plan = self.state["context"].get("draft_plan", "")
                 plan_review = self.state["context"].get("plan_review", "")
                 architect_config = self.executor._get_agent_config(AgentRole.ARCHITECT)
+                max_retries = self.state.get("max_iterations", 3)
+                validation_error = None
 
-                payload = {
-                    "mode": "finalize",
-                    "draft_plan": draft_plan,
-                    "coder_feedback": plan_review,
-                    "config": {
-                        "model_url": architect_config.get("url", "http://localhost:1233/v1"),
-                        "model_name": architect_config.get("model", "local-model"),
-                        "api_type": architect_config.get("api_type", "openai"),
-                        "temperature": 0.6,
-                        "max_tokens": 4000,
-                        "timeout": architect_config.get("timeout", 600)
+                for attempt in range(max_retries):
+                    payload = {
+                        "mode": "finalize",
+                        "draft_plan": draft_plan,
+                        "coder_feedback": plan_review,
+                        "config": {
+                            "model_url": architect_config.get("url", "http://localhost:1233/v1"),
+                            "model_name": architect_config.get("model", "local-model"),
+                            "api_type": architect_config.get("api_type", "openai"),
+                            "temperature": 0.6,
+                            "max_tokens": architect_config.get("max_tokens", 25000),
+                            "timeout": architect_config.get("timeout", 600)
+                        }
                     }
-                }
+                    if validation_error:
+                        payload["validation_error"] = validation_error
 
-                self._log_prompt("FINALIZE", "ARCHITECT", {"system_prompt": "FINALIZE_PROMPT", "user_message": plan_review, "draft_plan": draft_plan, "coder_feedback": plan_review}, mode="finalize")
+                    log_step = f"FINALIZE_RETRY{attempt}" if attempt > 0 else "FINALIZE"
+                    self._log_prompt(log_step, "ARCHITECT", {"system_prompt": "FINALIZE_PROMPT", "user_message": plan_review, "draft_plan": draft_plan, "coder_feedback": plan_review, "validation_error": validation_error}, mode="finalize")
 
-                try:
-                    output = self._run_external_agent("architect", payload)
-                    if output.get("status") == "error":
-                        raise Exception(output.get("error"))
+                    try:
+                        output = self._run_external_agent("architect", payload)
+                        if output.get("status") == "error":
+                            error_msg = output.get("error", "")
+                            if "Validation error" in error_msg and attempt < max_retries - 1:
+                                validation_error = error_msg
+                                print(f"  ⚠ Finalize plan validation failed (attempt {attempt + 1}/{max_retries}): {error_msg}")
+                                continue
+                            raise Exception(error_msg)
 
-                    final_plan = output.get("plan_yaml") or output.get("result", "")
-                    self.state["context"]["final_plan"] = final_plan
-                    self.state["context"]["plan_yaml"] = final_plan  # For backward compat
-                    task.result = final_plan
-                    task.status = TaskStatus.COMPLETED
-                    self._set_project_type_from_plan(final_plan)
-                    print(f"  ✓ Final plan produced ({len(final_plan)} chars)")
-                except Exception as e:
-                    task.status = TaskStatus.FAILED
-                    task.error = str(e)
+                        final_plan = output.get("plan_yaml") or output.get("result", "")
+                        self.state["context"]["final_plan"] = final_plan
+                        self.state["context"]["plan_yaml"] = final_plan  # For backward compat
+                        task.result = final_plan
+                        task.status = TaskStatus.COMPLETED
+                        self._set_project_type_from_plan(final_plan)
+                        if attempt > 0:
+                            print(f"  ✓ Final plan produced on retry {attempt + 1} ({len(final_plan)} chars)")
+                        else:
+                            print(f"  ✓ Final plan produced ({len(final_plan)} chars)")
+                        break
+                    except Exception as e:
+                        error_msg = str(e)
+                        if "Validation error" in error_msg and attempt < max_retries - 1:
+                            validation_error = error_msg
+                            print(f"  ⚠ Finalize plan validation failed (attempt {attempt + 1}/{max_retries}): {error_msg}")
+                            continue
+                        task.status = TaskStatus.FAILED
+                        task.error = error_msg
+                        break
 
                 task.completed_at = time.time()
                 self._update_context(task)
                 return task
 
-            # BUILD_FROM_PLAN: Coder builds all code (owns imports — no _fix_relative_imports)
+            # BUILD_FROM_PLAN: File-by-file build via PlanExecutor
             if task.task_type == "build_from_plan":
                 final_plan = self.state["context"].get("final_plan", "")
                 job_spec = self.state["context"].get("job_spec", self.state["context"].get("job_scope", ""))
-                coder_config = self.executor._get_agent_config(AgentRole.CODER)
+                user_request = self.state["context"].get("user_request", "")
 
-                payload = {
-                    "mode": "build",
-                    "plan_yaml": final_plan,
-                    "job_spec": job_spec,
-                    "config": {
-                        "model_url": coder_config.get("url", "http://localhost:1233/v1"),
-                        "model_name": coder_config.get("model", "local-model"),
-                        "api_type": coder_config.get("api_type", "openai"),
-                        "temperature": 0.2,
-                        "max_tokens": coder_config.get("max_tokens", 25000),
-                        "timeout": coder_config.get("timeout", 1200)
+                if PLAN_EXECUTOR_AVAILABLE:
+                    # Use PlanExecutor for file-by-file build with per-file compliance,
+                    # revision, anti-stub detection, and proper __init__.py generation
+                    try:
+                        pe = PlanExecutor(self.executor, self.config)
+                        result = pe.execute(final_plan, user_request=user_request, job_scope=job_spec)
+
+                        combined_output = result.get("combined_output", "")
+                        if not combined_output:
+                            raise Exception("PlanExecutor produced no output")
+
+                        self.state["context"]["latest_code"] = combined_output
+                        task.result = combined_output
+                        task.status = TaskStatus.COMPLETED
+
+                        n_success = sum(1 for s in result.get("status", {}).values() if s == "completed")
+                        n_total = len(result.get("status", {}))
+                        print(f"  ✓ Code built file-by-file ({n_success}/{n_total} files, {len(combined_output)} chars)")
+
+                        # Save files to disk immediately after build
+                        try:
+                            self._save_project_outputs()
+                        except Exception as save_err:
+                            print(f"  ⚠ Immediate save failed: {save_err}")
+
+                    except Exception as e:
+                        print(f"  ⚠ PlanExecutor failed ({e}), falling back to monolithic build")
+                        # Fall through to monolithic fallback below
+                        PLAN_EXECUTOR_AVAILABLE_FOR_BUILD = False
+                    else:
+                        PLAN_EXECUTOR_AVAILABLE_FOR_BUILD = True
+
+                    if not PLAN_EXECUTOR_AVAILABLE_FOR_BUILD:
+                        # Monolithic fallback
+                        coder_config = self.executor._get_agent_config(AgentRole.CODER)
+                        payload = {
+                            "mode": "build",
+                            "plan_yaml": final_plan,
+                            "job_spec": job_spec,
+                            "config": {
+                                "model_url": coder_config.get("url", "http://localhost:1233/v1"),
+                                "model_name": coder_config.get("model", "local-model"),
+                                "api_type": coder_config.get("api_type", "openai"),
+                                "temperature": 0.2,
+                                "max_tokens": coder_config.get("max_tokens", 25000),
+                                "timeout": coder_config.get("timeout", 1200)
+                            }
+                        }
+                        self._log_prompt("BUILD", "CODER", {"system_prompt": "BUILD_PROMPT", "user_message": final_plan, "plan_yaml": final_plan, "job_spec": job_spec}, mode="build")
+                        try:
+                            output = self._run_external_agent("coder", payload)
+                            if output.get("status") == "error":
+                                raise Exception(output.get("error"))
+                            result_text = output.get("result", "")
+                            result_text = self._clean_code_output(result_text)
+                            self.state["context"]["latest_code"] = result_text
+                            task.result = result_text
+                            task.status = TaskStatus.COMPLETED
+                            print(f"  ✓ Code built monolithic ({len(result_text)} chars)")
+                        except Exception as e:
+                            task.status = TaskStatus.FAILED
+                            task.error = str(e)
+                else:
+                    # No PlanExecutor available at all — monolithic build
+                    coder_config = self.executor._get_agent_config(AgentRole.CODER)
+                    payload = {
+                        "mode": "build",
+                        "plan_yaml": final_plan,
+                        "job_spec": job_spec,
+                        "config": {
+                            "model_url": coder_config.get("url", "http://localhost:1233/v1"),
+                            "model_name": coder_config.get("model", "local-model"),
+                            "api_type": coder_config.get("api_type", "openai"),
+                            "temperature": 0.2,
+                            "max_tokens": coder_config.get("max_tokens", 25000),
+                            "timeout": coder_config.get("timeout", 1200)
+                        }
                     }
-                }
-
-                self._log_prompt("BUILD", "CODER", {"system_prompt": "BUILD_PROMPT", "user_message": final_plan, "plan_yaml": final_plan, "job_spec": job_spec}, mode="build")
-
-                try:
-                    output = self._run_external_agent("coder", payload)
-                    if output.get("status") == "error":
-                        raise Exception(output.get("error"))
-
-                    result_text = output.get("result", "")
-                    result_text = self._clean_code_output(result_text)
-
-                    # NOTE: We do NOT call _fix_relative_imports — the coder owns imports
-                    self.state["context"]["latest_code"] = result_text
-                    task.result = result_text
-                    task.status = TaskStatus.COMPLETED
-                    print(f"  ✓ Code built ({len(result_text)} chars)")
-                except Exception as e:
-                    task.status = TaskStatus.FAILED
-                    task.error = str(e)
+                    self._log_prompt("BUILD", "CODER", {"system_prompt": "BUILD_PROMPT", "user_message": final_plan, "plan_yaml": final_plan, "job_spec": job_spec}, mode="build")
+                    try:
+                        output = self._run_external_agent("coder", payload)
+                        if output.get("status") == "error":
+                            raise Exception(output.get("error"))
+                        result_text = output.get("result", "")
+                        result_text = self._clean_code_output(result_text)
+                        self.state["context"]["latest_code"] = result_text
+                        task.result = result_text
+                        task.status = TaskStatus.COMPLETED
+                        print(f"  ✓ Code built monolithic ({len(result_text)} chars)")
+                    except Exception as e:
+                        task.status = TaskStatus.FAILED
+                        task.error = str(e)
 
                 task.completed_at = time.time()
                 self._update_context(task)
                 return task
 
-            # COMPLIANCE_REVIEW: Reviewer checks code against plan
+            # COMPLIANCE_REVIEW: Reviewer checks code against plan (FILE-BY-FILE)
             if task.task_type == "compliance_review":
                 final_plan = self.state["context"].get("final_plan", "")
                 latest_code = self.state["context"].get("latest_code", "")
                 reviewer_config = self.executor._get_agent_config(AgentRole.REVIEWER)
+                job_spec = self.state["context"].get("job_spec", self.state["context"].get("job_scope", ""))
 
-                payload = {
-                    "mode": "compliance",
-                    "plan_yaml": final_plan,
-                    "code": latest_code,
-                    "config": {
-                        "model_url": reviewer_config.get("url", "http://localhost:1233/v1"),
-                        "model_name": reviewer_config.get("model", "local-model"),
-                        "api_type": reviewer_config.get("api_type", "openai"),
-                        "temperature": 0.3,
-                        "max_tokens": 4000,
-                        "timeout": reviewer_config.get("timeout", 600)
+                # Try file-by-file compliance review
+                use_file_by_file = False
+                parsed_plan = None
+                all_files = {}
+
+                if PLAN_EXECUTOR_AVAILABLE and final_plan:
+                    try:
+                        pe = PlanExecutor.__new__(PlanExecutor)
+                        pe.plan = None
+                        pe.completed_files = {}
+                        parsed_plan = pe.parse_plan(final_plan)
+                        all_files = self._parse_multi_file_output(latest_code)
+                        if parsed_plan and parsed_plan.files and all_files:
+                            use_file_by_file = True
+                            print(f"  → File-by-file compliance review ({len(parsed_plan.files)} files)")
+                    except Exception as e:
+                        print(f"  → Plan parse failed ({e}), using monolithic compliance")
+
+                if use_file_by_file:
+                    try:
+                        per_file_results = {}
+                        failed_files = []
+                        all_results_text = []
+
+                        for file_spec in parsed_plan.files:
+                            fname = file_spec.name
+                            file_code = all_files.get(fname, "")
+
+                            if not file_code:
+                                per_file_results[fname] = {"status": "FAIL", "result": "File missing from generated code"}
+                                failed_files.append(fname)
+                                all_results_text.append(f"- {fname}: FAIL — File missing from generated code")
+                                print(f"    {fname}: FAIL (missing)")
+                                continue
+
+                            plan_spec_str = self._build_file_plan_spec_string(file_spec)
+                            dep_code = self._build_dependency_code_for_review(file_spec, all_files)
+
+                            payload = {
+                                "mode": "compliance_file",
+                                "file_name": fname,
+                                "file_code": file_code,
+                                "plan_spec": plan_spec_str,
+                                "dependency_code": dep_code,
+                                "job_spec": job_spec[:2000] if job_spec else "",
+                                "config": {
+                                    "model_url": reviewer_config.get("url", "http://localhost:1233/v1"),
+                                    "model_name": reviewer_config.get("model", "local-model"),
+                                    "api_type": reviewer_config.get("api_type", "openai"),
+                                    "temperature": 0.3,
+                                    "max_tokens": reviewer_config.get("max_tokens", 12000),
+                                    "timeout": reviewer_config.get("timeout", 600)
+                                }
+                            }
+
+                            self._log_prompt(f"COMPLIANCE_FILE_{fname}", "REVIEWER", {
+                                "system_prompt": "FILE_COMPLIANCE_PROMPT",
+                                "user_message": f"Review {fname}",
+                                "file_code": file_code[:2000],
+                                "plan_spec": plan_spec_str
+                            }, mode="compliance_file")
+
+                            output = self._run_external_agent("reviewer", payload)
+
+                            if output.get("status") == "error":
+                                per_file_results[fname] = {"status": "FAIL", "result": output.get("error", "Agent error")}
+                                failed_files.append(fname)
+                                print(f"    {fname}: FAIL (agent error)")
+                                continue
+
+                            result_text = output.get("result", "")
+
+                            # Cap issues to 10 per file to prevent revision prompt flooding
+                            result_text = self._cap_reviewer_issues(result_text, max_issues=10)
+
+                            self._log_prompt(f"COMPLIANCE_FILE_{fname}_RESULT", "REVIEWER", {
+                                "system_prompt": "",
+                                "user_message": result_text
+                            }, mode="compliance_file_result")
+
+                            # Parse STATUS from result
+                            result_upper = result_text.upper()
+                            if "STATUS: FAIL" in result_upper or "STATUS: NEEDS_REVISION" in result_upper:
+                                per_file_results[fname] = {"status": "FAIL", "result": result_text}
+                                failed_files.append(fname)
+                                all_results_text.append(f"- {fname}: FAIL\n{result_text}")
+                                print(f"    {fname}: FAIL")
+                            else:
+                                per_file_results[fname] = {"status": "PASS", "result": result_text}
+                                all_results_text.append(f"- {fname}: PASS")
+                                print(f"    {fname}: PASS")
+
+                        # Assemble overall result
+                        task.result = "FILE-BY-FILE COMPLIANCE REVIEW:\n\n" + "\n\n".join(all_results_text)
+
+                        if failed_files:
+                            task.metadata["needs_revision"] = True
+                            task.metadata["final_plan"] = final_plan
+                            task.metadata["per_file_results"] = per_file_results
+                            task.metadata["failed_files"] = failed_files
+                            print(f"  ⚠ Compliance review: {len(failed_files)}/{len(parsed_plan.files)} files NEED REVISION")
+                        else:
+                            print(f"  ✓ Compliance review: ALL {len(parsed_plan.files)} files APPROVED")
+
+                        task.status = TaskStatus.COMPLETED
+
+                    except Exception as e:
+                        print(f"  ⚠ File-by-file compliance failed ({e}), falling back to monolithic")
+                        use_file_by_file = False
+
+                # Fallback: monolithic compliance review (original behavior)
+                if not use_file_by_file:
+                    payload = {
+                        "mode": "compliance",
+                        "plan_yaml": final_plan,
+                        "code": latest_code,
+                        "config": {
+                            "model_url": reviewer_config.get("url", "http://localhost:1233/v1"),
+                            "model_name": reviewer_config.get("model", "local-model"),
+                            "api_type": reviewer_config.get("api_type", "openai"),
+                            "temperature": 0.3,
+                            "max_tokens": reviewer_config.get("max_tokens", 12000),
+                            "timeout": reviewer_config.get("timeout", 600)
+                        }
                     }
-                }
 
-                self._log_prompt("COMPLIANCE", "REVIEWER", {"system_prompt": "COMPLIANCE_PROMPT", "user_message": "(plan+code)", "plan_yaml": final_plan, "code": latest_code[:2000]}, mode="compliance")
+                    self._log_prompt("COMPLIANCE", "REVIEWER", {"system_prompt": "COMPLIANCE_PROMPT", "user_message": "(plan+code)", "plan_yaml": final_plan, "code": latest_code[:2000]}, mode="compliance")
 
-                try:
-                    output = self._run_external_agent("reviewer", payload)
-                    if output.get("status") == "error":
-                        raise Exception(output.get("error"))
+                    try:
+                        output = self._run_external_agent("reviewer", payload)
+                        if output.get("status") == "error":
+                            raise Exception(output.get("error"))
 
-                    result_text = output.get("result", "")
-                    task.result = result_text
+                        result_text = output.get("result", "")
+                        task.result = result_text
 
-                    # Check if revision is needed
-                    if "NEEDS_REVISION" in result_text.upper() or "STATUS: NEEDS_REVISION" in result_text.upper():
-                        task.metadata["needs_revision"] = True
-                        task.metadata["final_plan"] = final_plan
-                        print(f"  ⚠ Compliance review: NEEDS_REVISION")
-                    else:
-                        print(f"  ✓ Compliance review: APPROVED")
+                        if "NEEDS_REVISION" in result_text.upper() or "STATUS: NEEDS_REVISION" in result_text.upper():
+                            task.metadata["needs_revision"] = True
+                            task.metadata["final_plan"] = final_plan
+                            print(f"  ⚠ Compliance review: NEEDS_REVISION")
+                        else:
+                            print(f"  ✓ Compliance review: APPROVED")
 
-                    task.status = TaskStatus.COMPLETED
-                except Exception as e:
-                    task.status = TaskStatus.FAILED
-                    task.error = str(e)
+                        task.status = TaskStatus.COMPLETED
+                    except Exception as e:
+                        task.status = TaskStatus.FAILED
+                        task.error = str(e)
 
                 task.completed_at = time.time()
                 self._update_context(task)
@@ -2203,12 +2568,6 @@ Be specific and reference actual code from the project."""
                 task.result = plan_yaml
                 self._set_project_type_from_plan(plan_yaml)
                 task.status = TaskStatus.COMPLETED
-            else:
-                system_prompt = self._get_system_prompt(AgentRole.ARCHITECT, task.task_type, task.metadata)
-                user_message = self._build_user_message(task)
-                task.result = self.executor.execute_agent(AgentRole.ARCHITECT, system_prompt, user_message)
-                task.status = TaskStatus.COMPLETED
-                
                 task.completed_at = time.time()
                 self._update_context(task)
                 return task
@@ -2269,7 +2628,7 @@ Be specific and reference actual code from the project."""
                         architect_task = next((t for t in self.completed_tasks 
                                                if t.assigned_role == AgentRole.ARCHITECT), None)
                         if architect_task and architect_task.result:
-                            passed, missing = self._verify_coder_files(architect_task.result, result_text)
+                            passed, missing = self._verify_coder_files_v2(architect_task.result, result_text)
                             if not passed and missing:
                                 print(f"\n⚠️ FILE VERIFICATION WARNING: Missing files: {', '.join(missing)}")
                                 task.metadata["missing_files"] = missing
@@ -2336,6 +2695,7 @@ Be specific and reference actual code from the project."""
 
             # --- 6. TESTER TASK (External: Tester) ---
             if task.assigned_role == AgentRole.TESTER:
+                self._diag(f"TESTER HANDLER MATCHED for {task.task_id}")
                 system_prompt = self._get_system_prompt(AgentRole.TESTER, task.task_type, task.metadata)
                 user_message = self._build_user_message(task)
                 tester_config = self.executor._get_agent_config(AgentRole.TESTER)
@@ -2347,26 +2707,32 @@ Be specific and reference actual code from the project."""
                         "model_url": tester_config.get("url", "http://localhost:1233/v1"),
                         "model_name": tester_config.get("model", "local-model"),
                         "api_type": tester_config.get("api_type", "openai"),
-                        "temperature": 0.7,
-                        "max_tokens": 4000,
+                        "temperature": tester_config.get("temperature", 0.7),
+                        "max_tokens": tester_config.get("max_tokens", 4000),
                         "timeout": tester_config.get("timeout", 600)
                     }
                 }
 
                 try:
+                    self._diag(f"TESTER calling _run_external_agent")
                     output = self._run_external_agent("tester", payload)
                     if output.get("status") == "error":
                         raise Exception(output.get("error"))
-                    
-                    result_text = self._clean_test_output(output.get("result", ""))
+
+                    raw_result = output.get("result", "")
+                    self._diag(f"TESTER got raw result: {len(raw_result)} chars, starts_with={repr(raw_result[:60])}")
+                    result_text = self._clean_test_output(raw_result)
+                    self._diag(f"TESTER cleaned result: {len(result_text)} chars, starts_with={repr(result_text[:60])}")
                     task.result = result_text
                     task.status = TaskStatus.COMPLETED
                 except Exception as e:
+                    self._diag(f"TESTER EXCEPTION: {e}")
                     task.status = TaskStatus.FAILED
                     task.error = str(e)
-                
+
                 task.completed_at = time.time()
                 self._update_context(task)
+                self._diag(f"TESTER DONE: status={task.status.value} result_len={len(task.result) if task.result else 0}")
                 return task
 
             # --- 7. DOCUMENTER TASK (External: Documenter) ---
@@ -2456,7 +2822,7 @@ Be specific and reference actual code from the project."""
                         "model_name": opt_config.get("model", "local-model"),
                         "api_type": opt_config.get("api_type", "openai"),
                         "temperature": 0.6,
-                        "max_tokens": 4000,
+                        "max_tokens": opt_config.get("max_tokens", 4000),
                         "timeout": opt_config.get("timeout", 600)
                     }
                 }
@@ -2568,14 +2934,17 @@ Be specific and reference actual code from the project."""
                 task.completed_at = time.time()
                 return task
 
-        # --- END OF TASK HANDLERS ---
+            # --- END OF TASK HANDLERS ---
+            self._diag(f"FALLTHROUGH: no handler matched task_id={task.task_id} task_type={task.task_type} role={task.assigned_role}")
+
         except Exception as e:
             # Global exception handler
+            self._diag(f"OUTER EXCEPT: task_id={task.task_id} error={e}")
             task.status = TaskStatus.FAILED
             task.error = str(e)
             task.completed_at = time.time()
             print(f"  ✗ Task {task.task_id} failed: {e}")
-        
+
         return task
     
     def _clean_code_output(self, code: str) -> str:
@@ -2868,7 +3237,20 @@ Be specific and reference actual code from the project."""
         
         if not needs_revision:
             return False
-        
+
+        # Check if any review task has per_file_results → route to file-by-file revision
+        for rt in review_tasks:
+            if rt.metadata.get("per_file_results") and rt.metadata.get("failed_files"):
+                print(f"\n🔄 File-by-file revision for {len(rt.metadata['failed_files'])} failed files")
+                try:
+                    success = self._handle_file_by_file_revision(rt)
+                    if success:
+                        return True
+                    print(f"  ⚠ File-by-file revision failed, falling back to generic revision")
+                except Exception as e:
+                    print(f"  ⚠ File-by-file revision error ({e}), falling back to generic revision")
+                break
+
         # Find the coding task (also check build_from_plan for collaborative workflow)
         code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution", "build_from_plan")), None)
         if not code_task:
@@ -2919,13 +3301,479 @@ Be specific and reference actual code from the project."""
         self.execute_task(revision_task)
         
         if revision_task.status == TaskStatus.COMPLETED:
-            # Update the context with revised code
+            # MERGE revised files back into the full code
+            # Revision only outputs changed files — we must preserve unchanged files
+            original_code = code_task.result or ""
+            revised_code = revision_task.result or ""
+
+            original_files = self._parse_multi_file_output(original_code)
+            revised_files = self._parse_multi_file_output(revised_code)
+
+            if original_files and revised_files:
+                # Merge: revised files overwrite originals, keep everything else
+                merged_files = dict(original_files)
+                merged_files.update(revised_files)
+
+                # Reassemble into ### FILE: format
+                merged_parts = []
+                for fname, content in merged_files.items():
+                    merged_parts.append(f"### FILE: {fname} ###\n{content}")
+                merged_result = "\n\n".join(merged_parts)
+
+                revision_task.result = merged_result
+                print(f"   ✓ Merged {len(revised_files)} revised file(s) into {len(original_files)} total files")
+
+            # Update the context with merged code
             self._update_context(revision_task)
             self.completed_tasks.append(revision_task)
             return True
-        
+
         return False
-    
+
+    def _run_integration_check(self, all_files: Dict[str, str], parsed_plan=None) -> Dict[str, list]:
+        """
+        Pure-AST cross-file integration check. Validates:
+        1. Constructor arg count: ClassName(a, b) matches __init__(self, a, b)
+        2. Import resolution: from .module import X — module exists and exports X
+        3. Attribute access: self.x.field — field exists in x's class
+
+        Returns dict[filename -> list[str]] of issues per file.
+        """
+        import ast
+
+        issues_by_file = {}
+
+        # Step 1: Build maps from all files
+        # class_init_args: {"ClassName": {"file": fname, "args": ["a", "b"], "min_args": N}}
+        # file_exports: {"fname": set of top-level class/function names}
+        # class_attributes: {"ClassName": set of attr names (fields + methods)}
+        class_init_args = {}
+        file_exports = {}
+        class_attributes = {}
+
+        for fname, code in all_files.items():
+            try:
+                tree = ast.parse(code)
+            except SyntaxError:
+                continue
+
+            exports = set()
+            for node in ast.iter_child_nodes(tree):
+                if isinstance(node, ast.ClassDef):
+                    exports.add(node.name)
+                    attrs = set()
+
+                    for item in ast.walk(node):
+                        # Public methods
+                        if isinstance(item, ast.FunctionDef) or isinstance(item, ast.AsyncFunctionDef):
+                            attrs.add(item.name)
+                            # Parse __init__ for constructor signature
+                            if item.name == '__init__':
+                                args = item.args
+                                all_arg_names = [a.arg for a in args.args if a.arg != 'self']
+                                n_defaults = len(args.defaults)
+                                min_args = len(all_arg_names) - n_defaults
+                                class_init_args[node.name] = {
+                                    "file": fname,
+                                    "args": all_arg_names,
+                                    "min_args": min_args,
+                                    "max_args": len(all_arg_names)
+                                }
+                                # Also extract self.X assignments in __init__
+                                for stmt in ast.walk(item):
+                                    if isinstance(stmt, ast.Assign):
+                                        for target in stmt.targets:
+                                            if (isinstance(target, ast.Attribute) and
+                                                isinstance(target.value, ast.Name) and
+                                                target.value.id == 'self'):
+                                                attrs.add(target.attr)
+
+                        # Dataclass fields (annotated assignments)
+                        if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                            attrs.add(item.target.id)
+
+                        # Class-level assignments
+                        if isinstance(item, ast.Assign):
+                            for target in item.targets:
+                                if isinstance(target, ast.Name):
+                                    attrs.add(target.id)
+
+                    class_attributes[node.name] = attrs
+
+                    # Dataclass auto-init detection
+                    if node.name not in class_init_args:
+                        is_dataclass = any(
+                            (isinstance(d, ast.Name) and d.id == 'dataclass') or
+                            (isinstance(d, ast.Call) and isinstance(d.func, ast.Name) and d.func.id == 'dataclass') or
+                            (isinstance(d, ast.Attribute) and d.attr == 'dataclass')
+                            for d in node.decorator_list
+                        )
+                        if is_dataclass:
+                            dc_fields = []
+                            dc_required = 0
+                            for item in node.body:
+                                if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                                    dc_fields.append(item.target.id)
+                                    if item.value is None:
+                                        dc_required += 1
+                            class_init_args[node.name] = {
+                                "file": fname,
+                                "args": dc_fields,
+                                "min_args": dc_required,
+                                "max_args": len(dc_fields)
+                            }
+
+                elif isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
+                    exports.add(node.name)
+
+                elif isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            exports.add(target.id)
+
+            file_exports[fname] = exports
+
+        # Build module name map: "module_name" -> fname (e.g. "config" -> "config.py")
+        module_to_file = {}
+        for fname in all_files:
+            # Handle both "config.py" and "core/config.py"
+            base = fname.rsplit('/', 1)[-1] if '/' in fname else fname
+            module_name = base.replace('.py', '')
+            module_to_file[module_name] = fname
+            # Also map full path without .py
+            module_to_file[fname.replace('.py', '').replace('/', '.')] = fname
+
+        # Step 2: Check each file for integration issues
+        for fname, code in all_files.items():
+            try:
+                tree = ast.parse(code)
+            except SyntaxError:
+                continue
+
+            file_issues = []
+
+            # Check 1: Constructor arg count
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name) and node.func.id in class_init_args:
+                        cls_name = node.func.id
+                        info = class_init_args[cls_name]
+                        if info["file"] == fname:
+                            continue  # Skip self-file constructors
+                        n_provided = len(node.args) + len(node.keywords)
+                        if n_provided < info["min_args"]:
+                            file_issues.append(
+                                f"Constructor {cls_name}() called with {n_provided} args, "
+                                f"but __init__ requires at least {info['min_args']} "
+                                f"(params: {', '.join(info['args'])})"
+                            )
+                        elif n_provided > info["max_args"] and not any(
+                            True for a in [ast.parse("def f(**k): pass").body[0].args]
+                        ):
+                            # Don't flag if we can't detect **kwargs properly
+                            pass
+
+            # Check 2: Import resolution
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    # Handle relative imports: from .config import Settings
+                    module_path = node.module.lstrip('.')
+                    # Try to resolve module
+                    resolved_file = module_to_file.get(module_path)
+                    if not resolved_file:
+                        # Try last component
+                        last_part = module_path.rsplit('.', 1)[-1]
+                        resolved_file = module_to_file.get(last_part)
+
+                    if resolved_file and resolved_file in file_exports:
+                        for alias in (node.names or []):
+                            imported_name = alias.name
+                            if imported_name != '*' and imported_name not in file_exports[resolved_file]:
+                                file_issues.append(
+                                    f"Imports '{imported_name}' from {module_path}, "
+                                    f"but {resolved_file} does not export it "
+                                    f"(available: {', '.join(sorted(file_exports[resolved_file])[:10])})"
+                                )
+
+            # Check 3: self.X.Y attribute access validation
+            seen_attr_issues = set()
+            for cls_node in ast.iter_child_nodes(tree):
+                if not isinstance(cls_node, ast.ClassDef):
+                    continue
+                # Build self_type_map for this class
+                self_type_map = {}
+                for item in cls_node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == '__init__':
+                        param_types = {}
+                        for arg in item.args.args:
+                            if arg.arg == 'self':
+                                continue
+                            if arg.annotation:
+                                if isinstance(arg.annotation, ast.Name):
+                                    param_types[arg.arg] = arg.annotation.id
+                                elif isinstance(arg.annotation, ast.Attribute):
+                                    param_types[arg.arg] = arg.annotation.attr
+
+                        for stmt in ast.walk(item):
+                            if isinstance(stmt, ast.Assign):
+                                for target in stmt.targets:
+                                    if (isinstance(target, ast.Attribute) and
+                                            isinstance(target.value, ast.Name) and
+                                            target.value.id == 'self'):
+                                        attr_name = target.attr
+                                        if isinstance(stmt.value, ast.Name) and stmt.value.id in param_types:
+                                            self_type_map[attr_name] = param_types[stmt.value.id]
+                                        elif (isinstance(stmt.value, ast.Call) and
+                                              isinstance(stmt.value.func, ast.Name) and
+                                              stmt.value.func.id in class_attributes):
+                                            self_type_map[attr_name] = stmt.value.func.id
+
+                # Validate self.X.Y
+                for node in ast.walk(cls_node):
+                    if (isinstance(node, ast.Attribute) and
+                            isinstance(node.value, ast.Attribute) and
+                            isinstance(node.value.value, ast.Name) and
+                            node.value.value.id == 'self'):
+                        x_attr = node.value.attr
+                        y_attr = node.attr
+                        if x_attr in self_type_map:
+                            type_name = self_type_map[x_attr]
+                            if type_name in class_attributes:
+                                known_attrs = class_attributes[type_name]
+                                if y_attr not in known_attrs:
+                                    issue_key = (x_attr, y_attr, type_name)
+                                    if issue_key not in seen_attr_issues:
+                                        seen_attr_issues.add(issue_key)
+                                        file_issues.append(
+                                            f"self.{x_attr}.{y_attr} — '{y_attr}' not found in "
+                                            f"{type_name} (available: {', '.join(sorted(known_attrs)[:15])})"
+                                        )
+
+            # Check 4: Constructor keyword arg validation
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    cls_name = node.func.id
+                    if cls_name in class_init_args:
+                        info = class_init_args[cls_name]
+                        if info["file"] == fname:
+                            continue
+                        for kw in node.keywords:
+                            if kw.arg and kw.arg not in info["args"]:
+                                file_issues.append(
+                                    f"Constructor {cls_name}(... {kw.arg}=...) — "
+                                    f"'{kw.arg}' is not a parameter of __init__ "
+                                    f"(params: {', '.join(info['args'])})"
+                                )
+
+            if file_issues:
+                issues_by_file[fname] = file_issues
+
+        return issues_by_file
+
+    def _handle_file_by_file_revision(self, review_task) -> bool:
+        """
+        Handle revision using PlanExecutor's per-file revision infrastructure.
+        Uses multi-coder fallback, AST validation, anti-stub detection per file.
+        Returns True if revision succeeded.
+        """
+        if not PLAN_EXECUTOR_AVAILABLE:
+            return False
+
+        per_file_results = review_task.metadata.get("per_file_results", {})
+        failed_files = review_task.metadata.get("failed_files", [])
+        final_plan = review_task.metadata.get("final_plan", self.state["context"].get("final_plan", ""))
+
+        if not failed_files or not final_plan:
+            return False
+
+        # Get current code
+        latest_code = self.state["context"].get("latest_code", "")
+        all_files = self._parse_multi_file_output(latest_code)
+        if not all_files:
+            return False
+
+        # Instantiate PlanExecutor with the coordinator's executor and config
+        pe = PlanExecutor(self.executor, self.config)
+        try:
+            pe.plan = pe.parse_plan(final_plan)
+        except Exception as e:
+            print(f"    ⚠ Could not parse plan for revision: {e}")
+            return False
+
+        pe.job_scope = self.state["context"].get("job_spec", self.state["context"].get("job_scope", ""))
+        user_request = self.state["context"].get("user_request", "")
+
+        # Populate completed_files from current code so deps are available
+        for fname, code in all_files.items():
+            file_spec = pe._get_file_spec(fname)
+            if file_spec:
+                actual_exports = pe._extract_exports(code) if hasattr(pe, '_extract_exports') else []
+                pe.completed_files[fname] = FileResult(
+                    name=fname,
+                    content=code,
+                    actual_exports=actual_exports,
+                    status=FileStatus.COMPLETED
+                )
+
+        revised_count = 0
+
+        for fname in failed_files:
+            file_spec = pe._get_file_spec(fname)
+            if not file_spec:
+                print(f"    ⚠ {fname}: not in plan, skipping")
+                continue
+
+            file_code = all_files.get(fname, "")
+            review_result = per_file_results.get(fname, {})
+            review_text = review_result.get("result", "")
+
+            context = pe._build_context_for_file(file_spec)
+
+            if not file_code:
+                # Missing file — generate from scratch
+                print(f"    → {fname}: generating (missing)")
+                try:
+                    result = pe._generate_file(file_spec, user_request, context)
+                    if result.content:
+                        all_files[fname] = result.content
+                        pe.completed_files[fname] = result
+                        revised_count += 1
+                        print(f"    ✓ {fname}: generated ({len(result.content)} chars)")
+                    else:
+                        print(f"    ✗ {fname}: generation failed")
+                except Exception as e:
+                    print(f"    ✗ {fname}: generation error ({e})")
+            else:
+                # Failed file — build FileResult with reviewer issues, use _handle_revision
+                print(f"    → {fname}: revising")
+
+                # Parse issues from review text (capped at 10 to prevent prompt flooding)
+                issues = []
+                if review_text:
+                    # Extract issues from ISSUES: section
+                    issues_match = re.search(r'ISSUES:\s*\n(.*?)(?:\n\n|\Z)', review_text, re.DOTALL)
+                    if issues_match:
+                        for line in issues_match.group(1).strip().split('\n'):
+                            line = line.strip()
+                            if line and not line.lower().startswith('status'):
+                                # Remove leading numbering
+                                line = re.sub(r'^\d+\.\s*', '', line)
+                                if line:
+                                    issues.append(line)
+                    if not issues:
+                        issues.append(review_text[:500])
+                    # Cap to 10 issues max
+                    if len(issues) > 10:
+                        omitted = len(issues) - 10
+                        issues = issues[:10]
+                        issues.append(f"[... {omitted} additional issues omitted — fix the above first]")
+
+                actual_exports = pe._extract_exports(file_code) if hasattr(pe, '_extract_exports') else []
+                file_result = FileResult(
+                    name=fname,
+                    content=file_code,
+                    actual_exports=actual_exports,
+                    status=FileStatus.PLAN_MISMATCH,
+                    plan_compliance={"passed": False, "issues": issues}
+                )
+
+                try:
+                    revised = pe._handle_revision(file_spec, file_result, context, user_request)
+                    if revised.content and revised.status in (FileStatus.COMPLETED, FileStatus.PLAN_MISMATCH):
+                        all_files[fname] = revised.content
+                        pe.completed_files[fname] = revised
+                        revised_count += 1
+                        print(f"    ✓ {fname}: revised ({len(revised.content)} chars, status={revised.status.value})")
+                    else:
+                        print(f"    ✗ {fname}: revision produced no content")
+                except Exception as e:
+                    print(f"    ✗ {fname}: revision error ({e})")
+
+            self._log_prompt(f"COMPLIANCE_REVISION_{fname}", "CODER", {
+                "system_prompt": "(per-file revision)",
+                "user_message": f"Revised {fname}",
+                "file_code": all_files.get(fname, "")[:2000]
+            }, mode="file_revision")
+
+        if revised_count == 0:
+            return False
+
+        # Post-revision cross-file integration validation
+        try:
+            integration_issues = self._run_integration_check(all_files, pe.plan if pe.plan else None)
+            if integration_issues:
+                total_issues = sum(len(v) for v in integration_issues.values())
+                print(f"\n  ⚠ Integration check found {total_issues} cross-file issues in {len(integration_issues)} files")
+                for ifname, iissues in integration_issues.items():
+                    for iss in iissues[:3]:
+                        print(f"    → {ifname}: {iss}")
+
+                # Attempt one more revision pass on affected files
+                integration_revised = 0
+                for ifname, iissues in integration_issues.items():
+                    file_spec = pe._get_file_spec(ifname)
+                    if not file_spec or ifname not in all_files:
+                        continue
+
+                    context = pe._build_context_for_file(file_spec)
+                    actual_exports = pe._extract_exports(all_files[ifname]) if hasattr(pe, '_extract_exports') else []
+                    file_result = FileResult(
+                        name=ifname,
+                        content=all_files[ifname],
+                        actual_exports=actual_exports,
+                        status=FileStatus.PLAN_MISMATCH,
+                        plan_compliance={"passed": False, "issues": iissues[:10]}
+                    )
+
+                    try:
+                        revised = pe._handle_revision(file_spec, file_result, context, user_request)
+                        if revised.content and revised.status in (FileStatus.COMPLETED, FileStatus.PLAN_MISMATCH):
+                            all_files[ifname] = revised.content
+                            pe.completed_files[ifname] = revised
+                            integration_revised += 1
+                            print(f"    ✓ {ifname}: integration-revised ({len(revised.content)} chars)")
+                    except Exception as e:
+                        print(f"    ✗ {ifname}: integration revision error ({e})")
+
+                if integration_revised > 0:
+                    print(f"  ✓ Integration revision: {integration_revised} files fixed")
+                else:
+                    print(f"  ⚠ Integration issues remain (could not auto-fix)")
+        except Exception as e:
+            print(f"  ⚠ Integration check error: {e}")
+
+        # Reassemble all files into ### FILE: format
+        merged_parts = []
+        for fname, content in all_files.items():
+            merged_parts.append(f"### FILE: {fname} ###\n{content}")
+        merged_result = "\n\n".join(merged_parts)
+
+        # Create synthetic revision task
+        revision_task = Task(
+            task_id=f"T_file_revision_{int(time.time())}",
+            task_type="revision",
+            description=f"File-by-file revision of {revised_count} files",
+            assigned_role=AgentRole.CODER,
+            status=TaskStatus.COMPLETED,
+            priority=10,
+            metadata={"is_revision": True, "revised_files": list(all_files.keys())}
+        )
+        revision_task.result = merged_result
+        revision_task.completed_at = time.time()
+
+        # Update context and save
+        self._update_context(revision_task)
+        self.completed_tasks.append(revision_task)
+
+        # Save to disk immediately
+        try:
+            self._save_project_outputs()
+            print(f"  ✓ File-by-file revision complete: {revised_count}/{len(failed_files)} files revised, all {len(all_files)} files saved")
+        except Exception as e:
+            print(f"  ⚠ Save after revision failed: {e}")
+
+        return True
+
     def run_workflow(self, user_request: str, workflow_type: str = "standard"):
         """Execute a complete workflow"""
         print("=" * 80)
