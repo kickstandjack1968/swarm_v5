@@ -2282,6 +2282,34 @@ PROJECT STRUCTURE
                             print(f"  ⚠ Compliance review: {len(failed_files)}/{len(parsed_plan.files)} files NEED REVISION")
                         else:
                             print(f"  ✓ Compliance review: ALL {len(parsed_plan.files)} files APPROVED")
+                            # Even when LLM review passes, run AST integration check
+                            # to catch cross-file bugs the LLM misses (wrong method names, constructor args)
+                            try:
+                                integration_issues = self._run_integration_check(all_files, parsed_plan)
+                                if integration_issues:
+                                    total_issues = sum(len(v) for v in integration_issues.values())
+                                    print(f"  ⚠ Integration check found {total_issues} cross-file issues in {len(integration_issues)} files")
+                                    for ifname, iissues in integration_issues.items():
+                                        for iss in iissues[:2]:
+                                            print(f"    → {ifname}: {iss}")
+                                    for ifname, iissues in integration_issues.items():
+                                        issue_text = "\n".join(f"- {iss}" for iss in iissues[:10])
+                                        per_file_results[ifname] = {
+                                            "status": "FAIL",
+                                            "result": f"STATUS: FAIL\nISSUES (cross-file integration):\n{issue_text}"
+                                        }
+                                        if ifname not in failed_files:
+                                            failed_files.append(ifname)
+                                    task.metadata["needs_revision"] = True
+                                    task.metadata["final_plan"] = final_plan
+                                    task.metadata["per_file_results"] = per_file_results
+                                    task.metadata["failed_files"] = failed_files
+                                    task.result += f"\n\nINTEGRATION CHECK: {len(failed_files)} files need cross-file revision"
+                                    print(f"  ⚠ Integration check: {len(failed_files)} files will be revised")
+                                else:
+                                    print(f"  ✓ Integration check: no cross-file issues found")
+                            except Exception as ie:
+                                print(f"  ⚠ Integration check failed ({ie}), skipping")
 
                         task.status = TaskStatus.COMPLETED
 

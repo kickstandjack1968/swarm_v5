@@ -325,7 +325,12 @@ RULES:
         if not job_spec:
             return {"status": "error", "ok": False, "error": "No job_spec provided for draft mode"}
 
-        user_prompt = f"Create a YAML execution plan for this project:\n\n{job_spec}\n\nOutput the YAML plan:"
+        validation_error = input_data.get("validation_error", "")
+        fix_section = ""
+        if validation_error:
+            fix_section = f"\n\nPREVIOUS PLAN REJECTED — FIX THESE ERRORS:\n{validation_error}\n\nCommon fixes:\n- Use path-based filenames (core/module.py not core.module)\n- needs_from must ONLY reference internal project files, not external packages\n- Every type in method signatures MUST appear in needs_from for that file\n"
+
+        user_prompt = f"Create a YAML execution plan for this project:\n\n{job_spec}{fix_section}\n\nOutput the YAML plan:"
 
         messages = [
             {"role": "system", "content": self.DRAFT_PLAN_PROMPT},
@@ -340,13 +345,17 @@ RULES:
         draft_plan = input_data.get("draft_plan", "")
         coder_feedback = input_data.get("coder_feedback", "")
         job_spec = input_data.get("job_spec", "")
+        validation_error = input_data.get("validation_error", "")
 
         if not draft_plan:
             return {"status": "error", "ok": False, "error": "No draft_plan provided for finalize mode"}
 
         job_spec_section = f"\nORIGINAL REQUIREMENTS (verify your final plan covers ALL of these):\n{job_spec}\n" if job_spec else ""
+        fix_section = ""
+        if validation_error:
+            fix_section = f"\nPREVIOUS PLAN REJECTED — FIX THESE ERRORS:\n{validation_error}\n\nCommon fixes:\n- Every type in a method signature MUST appear in needs_from so coders get its code\n- File names in needs_from must be exact path-based names (core/module.py not core.module)\n- needs_from must ONLY reference internal project files\n"
 
-        user_prompt = f"""{job_spec_section}
+        user_prompt = f"""{job_spec_section}{fix_section}
 DRAFT PLAN:
 ```yaml
 {draft_plan}
@@ -606,6 +615,47 @@ Output the COMPLETE revised YAML plan:"""
         for item in plan['execution_order']:
             if item not in file_names:
                 raise ValueError(f"execution_order contains unknown file '{item}'")
+
+        # Validate that non-primitive types in method signatures are declared in needs_from
+        # This ensures coders receive dependency code for every type they need to use.
+        PRIMITIVES = {
+            'str', 'int', 'float', 'bool', 'dict', 'list', 'tuple', 'set', 'bytes',
+            'None', 'Any', 'Optional', 'Union', 'List', 'Dict', 'Tuple', 'Set',
+            'Callable', 'Iterator', 'Generator', 'Type', 'object', 'callable',
+            'self', 'cls', 'T', 'KT', 'VT'
+        }
+        import re as _re
+        for f in plan['files']:
+            name = f['name']
+            import_map = f.get('imports_from', {}) or f.get('needs_from', {})
+            importable_types = set()
+            for src_imports in (import_map or {}).values():
+                if isinstance(src_imports, list):
+                    importable_types.update(src_imports)
+            own_exports = file_exports.get(name, set())
+
+            for exp in f.get('exports', []):
+                if not isinstance(exp, dict):
+                    continue
+                for method_name, method_info in exp.get('methods', {}).items():
+                    if not isinstance(method_info, dict):
+                        continue
+                    for arg_str in method_info.get('args', []):
+                        if not isinstance(arg_str, str) or ':' not in arg_str:
+                            continue
+                        type_part = arg_str.split(':', 1)[1].strip()
+                        # Strip generics: list[T] → list, Optional[T] → Optional
+                        base_type = _re.sub(r'\[.*', '', type_part).strip()
+                        base_type = base_type.lstrip('*').strip()
+                        if (base_type and base_type not in PRIMITIVES
+                                and base_type not in own_exports
+                                and base_type not in importable_types):
+                            raise ValueError(
+                                f"File '{name}' method '{exp.get('name','?')}.{method_name}' "
+                                f"parameter '{arg_str}' uses type '{base_type}', but '{base_type}' "
+                                f"is not listed in needs_from. Add the file that exports '{base_type}' "
+                                f"to needs_from so coders can see its interface."
+                            )
 
 
 if __name__ == "__main__":
