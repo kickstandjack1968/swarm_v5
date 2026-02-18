@@ -97,10 +97,16 @@ REVIEW FOR:
 1. Are file responsibilities clear and non-overlapping?
 2. Are dependencies between files reasonable? Any circular risks?
 3. Are exports sufficient for the files that need them?
+   CRITICAL: Every class export that other files call methods on MUST have a `methods:` block listing
+   those methods with args and return types. A description string is NOT sufficient — it is ignored
+   by tooling. Flag any class export missing a `methods:` block as a CONCERN.
 4. Are requirements specific enough to implement?
 5. Is execution order correct?
 6. Any missing files (utils, __init__.py, config files)?
 7. Will the entry point wire everything together correctly?
+   Check: does the entry point's requirements list the EXACT method calls it will make?
+   e.g. "call processor.run(input_path) -> dict" not just "run the processor"
+   If the entry point requirements are vague, flag it — the coder will invent wrong method names.
 8. Is this over-engineered for what's being asked?
 
 OUTPUT FORMAT:

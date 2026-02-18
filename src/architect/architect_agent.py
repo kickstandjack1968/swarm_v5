@@ -177,10 +177,22 @@ files:
       - name: "Processor"
         type: "class"
         description: "Processes input data files"
+        methods:
+          __init__:
+            args: ["self", "settings: Settings"]
+            returns: "None"
+          run:
+            args: ["self", "input_path: Path"]
+            returns: "dict"
+          process_batch:
+            args: ["self", "paths: list[Path]"]
+            returns: "list[dict]"
     needs_from:
       config.py: ["Settings"]
     requirements:
       - "Read CSV files using csv.DictReader, extract rows matching filter criteria"
+      - "run(input_path: Path) -> dict: process one file, return dict with keys: rows (list[dict]), stats (dict)"
+      - "process_batch(paths: list[Path]) -> list[dict]: process multiple files, return list of result dicts"
       - "Compute statistics (mean, median, std) using statistics module"
       - "Write results to JSON using json.dump with indent=2"
 
@@ -193,7 +205,8 @@ files:
       "core/processor.py": ["Processor"]
     requirements:
       - "Parse CLI arguments with argparse (--input, --output, --config)"
-      - "Initialize Settings and Processor, call processor.run()"
+      - "Initialize Settings(), then Processor(settings), then call processor.run(input_path) -> dict"
+      - "Print or save the dict returned by processor.run()"
 
 execution_order: ["config.py", "core/processor.py", "main.py"]
 ```
@@ -225,9 +238,32 @@ INTERFACE CONTRACTS (CRITICAL — prevents cross-file mismatches):
     GOOD: "Dataclass with fields: log_directories (list[str]), max_file_size (int, default 10485760), encoding (str, default 'utf-8'), output_dir (Path, default ~/.eve/logs)"
 12. If downstream files need specific attributes from a class, those attributes MUST be declared in that class's requirements.
     Think: what fields/methods will other files actually call on this class? List them ALL.
-13. The exports description MUST mention key methods WITH RETURN TYPES when other files depend on them.
-    BAD:  description: "Parses log files"
-    GOOD: description: "Parses log files. Methods: parse_file(path) -> list[dict], discover(dirs) -> list[Path]"
+13. Class exports MUST include a `methods:` block for every public method other files will call.
+    The `methods:` block is MACHINE-READ — it drives mandatory export checks and coder prompts.
+    DO NOT put method signatures in the description string — they are ignored by tooling.
+    BAD (description string — IGNORED):
+      exports:
+        - name: "Processor"
+          type: "class"
+          description: "Processes files. Methods: run(path) -> dict"  # ← tooling never reads this
+    GOOD (structured methods: block — ENFORCED):
+      exports:
+        - name: "Processor"
+          type: "class"
+          description: "Processes input data files"
+          methods:
+            __init__:
+              args: ["self", "settings: Settings"]
+              returns: "None"
+            run:
+              args: ["self", "input_path: Path"]
+              returns: "dict"
+            process_batch:
+              args: ["self", "paths: list[Path]"]
+              returns: "list[dict]"
+    Every method that another file will call MUST appear in this block.
+    The entry point file (main.py) depends entirely on these signatures — if they are wrong or missing,
+    the entry point coder WILL invent wrong method names and the project will not run.
 14. RETURN TYPES ARE CRITICAL. Every method mentioned in requirements or exports MUST specify what it returns.
     BAD:  "Implement get_summary method for generating text summary"
     GOOD: "get_summary() -> str: returns plain English summary of findings"
@@ -252,9 +288,22 @@ RULES:
 5. Output the COMPLETE revised YAML plan
 6. Config/settings/dataclass files MUST list ALL their fields in requirements
    Example: "Dataclass with fields: log_dirs (list[str]), max_file_size (int, default 10MB), encoding (str, default 'utf-8')"
-7. Every class export description should mention key methods and their parameter signatures
-   Example: description: "Parses logs. Methods: parse_file(path) -> list[dict], discover(dirs) -> list[Path]"
-8. Cross-check: for each file's requirements, verify that every attribute/method it needs from dependencies is actually declared in those dependencies' requirements"""
+7. Every class export MUST have a `methods:` block — NOT a description string with method names.
+   The `methods:` block is machine-read and drives coder prompts. Description strings are ignored.
+   BAD:  description: "Parses logs. Methods: parse_file(path) -> list[dict]"   ← IGNORED
+   GOOD:
+     methods:
+       parse_file:
+         args: ["self", "path: Path"]
+         returns: "list[dict]"
+       discover:
+         args: ["self", "dirs: list[str]"]
+         returns: "list[Path]"
+8. Cross-check: for every method a file calls on a dependency, verify that method exists in the
+   dependency's `methods:` block with matching argument names and return type.
+9. main.py and other entry points MUST list exact method calls in requirements:
+   BAD:  "Initialize and run the processor"
+   GOOD: "Initialize Processor(settings), call processor.run(input_path) -> dict, print result" """
     
     def process(self, input_data: dict) -> dict:
         """Generate YAML execution plan."""
