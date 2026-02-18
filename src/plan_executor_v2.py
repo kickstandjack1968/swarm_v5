@@ -271,38 +271,43 @@ class PlanExecutor:
     def _generate_import_block(self, file_spec: FileSpec) -> str:
         """
         Generate exact import statements from the PLAN.
-        
-        This is the key fix: imports come from the plan's imports_from field,
-        NOT from what previous files actually exported.
+
+        Uses common-prefix relative depth algorithm to compute correct
+        relative imports regardless of directory depth.
         """
         if not file_spec.imports_from:
             return ""
-        
+
         lines = []
-        current_folder = file_spec.name.rsplit('/', 1)[0] if '/' in file_spec.name else ''
-        
+        # Split importer path into directory parts
+        importer_parts = file_spec.name.rsplit('/', 1)[0].split('/') if '/' in file_spec.name else []
+
         for source_file, import_names in file_spec.imports_from.items():
             if not import_names:
                 continue
-            
-            # Determine import style based on folder structure
-            source_folder = source_file.rsplit('/', 1)[0] if '/' in source_file else ''
-            source_module = source_file.replace('.py', '')
-            
-            if source_folder == current_folder and current_folder:
-                # Same folder -> relative import
-                source_base = source_file.rsplit('/', 1)[-1].replace('.py', '')
-                import_stmt = f"from .{source_base} import {', '.join(import_names)}"
-            elif '/' in source_file:
-                # Different folder -> absolute with dots
-                import_path = source_module.replace('/', '.')
-                import_stmt = f"from {import_path} import {', '.join(import_names)}"
-            else:
-                # Root level -> relative import
-                import_stmt = f"from .{source_module} import {', '.join(import_names)}"
-            
+
+            source_parts = source_file.rsplit('/', 1)[0].split('/') if '/' in source_file else []
+            source_base = source_file.rsplit('/', 1)[-1].replace('.py', '')
+
+            # Find common prefix length
+            common = 0
+            while common < min(len(importer_parts), len(source_parts)):
+                if importer_parts[common] == source_parts[common]:
+                    common += 1
+                else:
+                    break
+
+            # Levels up from importer to common ancestor
+            up = len(importer_parts) - common
+            # Remaining path segments after common ancestor
+            remaining = source_parts[common:]
+
+            dots = "." * (up + 1)  # "." = current pkg, ".." = parent, etc.
+            module_path = ".".join(remaining + [source_base])
+
+            import_stmt = f"from {dots}{module_path} import {', '.join(import_names)}"
             lines.append(import_stmt)
-        
+
         return '\n'.join(lines)
     
     def _generate_import_documentation(self, file_spec: FileSpec) -> str:
@@ -548,14 +553,22 @@ class PlanExecutor:
         if file_spec.dependencies:
             integration_issues = self._check_integration(file_spec, result, context)
             if integration_issues:
-                compliance["warnings"].extend(integration_issues)
+                # Split into warnings vs errors — errors fail compliance
+                warnings = [i for i in integration_issues if 'warning' in i.lower()]
+                errors = [i for i in integration_issues if 'warning' not in i.lower()]
+                if warnings:
+                    compliance["warnings"].extend(warnings)
+                if errors:
+                    compliance["passed"] = False
+                    compliance["issues"].extend(errors)
         
         return compliance
     
     def _detect_placeholders(self, content: str) -> List[str]:
         """Detect lazy placeholder implementations."""
         issues = []
-        
+
+        # --- Part 1: Regex-based checks ---
         placeholder_patterns = [
             (r'raise\s+NotImplementedError', "Contains NotImplementedError"),
             (r'pass\s*$', "Contains empty pass statement"),
@@ -564,7 +577,7 @@ class PlanExecutor:
             (r'#\s*FIXME', "Contains FIXME comment"),
             (r'return\s+None\s*#', "Suspicious return None with comment"),
         ]
-        
+
         for pattern, message in placeholder_patterns:
             if re.search(pattern, content, re.MULTILINE):
                 # Check context - some are legitimate
@@ -589,11 +602,63 @@ class PlanExecutor:
                                 if node.value.value is ...:
                                     issues.append(message)
                                     break
-                    except:
+                    except Exception:
                         pass
                 else:
                     issues.append(message)
-        
+
+        # --- Part 2: AST-based class stub and shadow import detection ---
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return issues
+
+        def _is_stub_body(body):
+            """Check if a class body is effectively empty (stub)."""
+            if not body:
+                return True
+            # Single Pass
+            if len(body) == 1 and isinstance(body[0], ast.Pass):
+                return True
+            # Single Ellipsis
+            if (len(body) == 1 and isinstance(body[0], ast.Expr) and
+                    isinstance(body[0].value, ast.Constant) and body[0].value.value is ...):
+                return True
+            # Docstring + Pass
+            if len(body) == 2:
+                has_docstring = (isinstance(body[0], ast.Expr) and
+                                 isinstance(body[0].value, ast.Constant) and
+                                 isinstance(body[0].value.value, str))
+                if has_docstring and isinstance(body[1], ast.Pass):
+                    return True
+                if has_docstring and (isinstance(body[1], ast.Expr) and
+                        isinstance(body[1].value, ast.Constant) and body[1].value.value is ...):
+                    return True
+            return False
+
+        # Collect imported names from ImportFrom at module level
+        imported_names = set()
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, ast.ImportFrom) and node.names:
+                for alias in node.names:
+                    name = alias.asname if alias.asname else alias.name
+                    imported_names.add(name)
+
+        # Check module-level ClassDef nodes
+        for node in ast.iter_child_nodes(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+
+            if _is_stub_body(node.body):
+                issues.append(f"Empty class stub: class {node.name} has no real implementation")
+
+                # Shadow import: class redefines an imported name as empty
+                if node.name in imported_names:
+                    issues.append(
+                        f"Shadow import: class {node.name} redefines imported name "
+                        f"'{node.name}' as an empty stub"
+                    )
+
         return issues
     
     def _check_integration(
@@ -602,66 +667,127 @@ class PlanExecutor:
         result: FileResult,
         context: Dict[str, Any]
     ) -> List[str]:
-        """Check that calls to dependencies use correct signatures."""
+        """Check that calls to dependencies use correct signatures.
+
+        Pure AST implementation — no agent_base dependency.
+        Validates constructor arg counts and detects phantom imports.
+        """
         issues = []
-        
+
         try:
             tree = ast.parse(result.content)
         except SyntaxError:
             return issues
-        
-        # Build signature map from dependencies
-        dep_signatures = {}
+
+        # --- Section 1: Extract dependency signatures via AST ---
+        # Maps class_name -> {'init_args': int (excluding self), 'init_arg_names': [...],
+        #                      'class_attributes': set, 'methods': set}
+        dep_classes = {}
+        dep_file_modules = set()  # base module names from all plan files
+
+        all_files = context.get('all_files', {})
+        for fname in all_files:
+            mod = fname.rsplit('/', 1)[-1].replace('.py', '')
+            dep_file_modules.add(mod)
+
         for dep_name, dep_info in context.get('dependencies', {}).items():
             dep_content = dep_info.get('content', '')
-            if dep_content:
-                try:
-                    from agent_base import extract_function_signatures, extract_class_info
-                    
-                    # Get function signatures
-                    sigs = extract_function_signatures(dep_content)
-                    dep_signatures.update(sigs)
-                    
-                    # Get class method signatures
-                    classes = extract_class_info(dep_content)
-                    for class_name, class_info in classes.items():
-                        for method_name, method_info in class_info.get('methods', {}).items():
-                            dep_signatures[f"{class_name}.{method_name}"] = method_info
-                except ImportError:
-                    pass
-        
-        # Check calls in current file
-        class CallChecker(ast.NodeVisitor):
-            def __init__(self):
-                self.issues = []
-            
-            def visit_Call(self, node):
-                # Get function name
-                if isinstance(node.func, ast.Name):
-                    func_name = node.func.id
-                elif isinstance(node.func, ast.Attribute):
-                    func_name = node.func.attr
-                else:
-                    self.generic_visit(node)
-                    return
-                
-                # Check against known signatures
-                if func_name in dep_signatures:
-                    sig = dep_signatures[func_name]
-                    required = sig.get('required_args', 0)
-                    provided = len(node.args) + len(node.keywords)
-                    
-                    if provided < required:
-                        self.issues.append(
-                            f"Call to {func_name}() provides {provided} args but requires {required}"
-                        )
-                
-                self.generic_visit(node)
-        
-        checker = CallChecker()
-        checker.visit(tree)
-        issues.extend(checker.issues)
-        
+            if not dep_content:
+                continue
+            try:
+                dep_tree = ast.parse(dep_content)
+            except SyntaxError:
+                continue
+
+            for node in ast.iter_child_nodes(dep_tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                cls_name = node.name
+                init_args = 0
+                init_arg_names = []
+                class_attrs = set()
+                methods = set()
+
+                for item in node.body:
+                    # Collect methods
+                    if isinstance(item, ast.FunctionDef) or isinstance(item, ast.AsyncFunctionDef):
+                        if not (item.name.startswith('__') and item.name.endswith('__') and item.name != '__init__'):
+                            methods.add(item.name)
+                        if item.name == '__init__':
+                            # Count args excluding self
+                            args = item.args
+                            all_args = [a.arg for a in args.args if a.arg != 'self']
+                            defaults_count = len(args.defaults)
+                            init_args = len(all_args) - defaults_count  # required args
+                            init_arg_names = all_args
+                            # Collect self.X assignments in __init__
+                            for stmt in ast.walk(item):
+                                if isinstance(stmt, ast.Assign):
+                                    for target in stmt.targets:
+                                        if (isinstance(target, ast.Attribute) and
+                                                isinstance(target.value, ast.Name) and
+                                                target.value.id == 'self'):
+                                            class_attrs.add(target.attr)
+                        if item.name in ('__init__', '__post_init__'):
+                            for stmt in ast.walk(item):
+                                if isinstance(stmt, ast.Assign):
+                                    for target in stmt.targets:
+                                        if (isinstance(target, ast.Attribute) and
+                                                isinstance(target.value, ast.Name) and
+                                                target.value.id == 'self'):
+                                            class_attrs.add(target.attr)
+                    # Dataclass fields (annotated assignments)
+                    elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                        class_attrs.add(item.target.id)
+                    # Class-level assignments
+                    elif isinstance(item, ast.Assign):
+                        for target in item.targets:
+                            if isinstance(target, ast.Name):
+                                class_attrs.add(target.id)
+
+                # Methods are also accessible as attributes
+                class_attrs.update(methods)
+
+                dep_classes[cls_name] = {
+                    'init_args': init_args,
+                    'init_arg_names': init_arg_names,
+                    'class_attributes': class_attrs,
+                    'methods': methods,
+                }
+
+        # --- Section 2: Constructor arg validation ---
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id in dep_classes:
+                cls_name = node.func.id
+                cls_info = dep_classes[cls_name]
+                required = cls_info['init_args']
+                provided = len(node.args) + len(node.keywords)
+                if provided < required:
+                    issues.append(
+                        f"Constructor {cls_name}() provides {provided} args but requires {required}"
+                    )
+                elif provided > len(cls_info['init_arg_names']):
+                    issues.append(
+                        f"Constructor {cls_name}() provides {provided} args but __init__ only accepts {len(cls_info['init_arg_names'])}"
+                    )
+
+        # --- Section 3: Phantom import detection ---
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                # Relative imports: check that the referenced module exists in plan files
+                if node.level > 0:
+                    # Extract base module name (last segment)
+                    parts = node.module.split('.') if node.module else []
+                    if parts:
+                        base_mod = parts[-1]
+                        if base_mod not in dep_file_modules:
+                            issues.append(
+                                f"Phantom import: 'from {'.' * node.level}{node.module}' — "
+                                f"module '{base_mod}' not found in project files"
+                            )
+
         return issues
     
     # =========================================================================
