@@ -1967,11 +1967,13 @@ PROJECT STRUCTURE
             # PLAN_REVIEW: Coder reviews draft plan (no code)
             if task.task_type == "plan_review":
                 draft_plan = self.state["context"].get("draft_plan", "")
+                job_spec = self.state["context"].get("job_spec", self.state["context"].get("job_scope", ""))
                 coder_config = self.executor._get_agent_config(AgentRole.CODER)
 
                 payload = {
                     "mode": "plan_review",
                     "plan_yaml": draft_plan,
+                    "job_spec": job_spec,
                     "config": {
                         "model_url": coder_config.get("url", "http://localhost:1233/v1"),
                         "model_name": coder_config.get("model", "local-model"),
@@ -1982,7 +1984,7 @@ PROJECT STRUCTURE
                     }
                 }
 
-                self._log_prompt("PLAN_REVIEW", "CODER", {"system_prompt": "PLAN_REVIEW_PROMPT", "user_message": draft_plan, "plan_yaml": draft_plan}, mode="plan_review")
+                self._log_prompt("PLAN_REVIEW", "CODER", {"system_prompt": "PLAN_REVIEW_PROMPT", "user_message": draft_plan, "plan_yaml": draft_plan, "job_spec": job_spec}, mode="plan_review")
 
                 try:
                     output = self._run_external_agent("coder", payload)
@@ -2006,6 +2008,7 @@ PROJECT STRUCTURE
             if task.task_type == "finalize_plan":
                 draft_plan = self.state["context"].get("draft_plan", "")
                 plan_review = self.state["context"].get("plan_review", "")
+                job_spec = self.state["context"].get("job_spec", self.state["context"].get("job_scope", ""))
                 architect_config = self.executor._get_agent_config(AgentRole.ARCHITECT)
                 max_retries = self.state.get("max_iterations", 3)
                 validation_error = None
@@ -2015,6 +2018,7 @@ PROJECT STRUCTURE
                         "mode": "finalize",
                         "draft_plan": draft_plan,
                         "coder_feedback": plan_review,
+                        "job_spec": job_spec,
                         "config": {
                             "model_url": architect_config.get("url", "http://localhost:1233/v1"),
                             "model_name": architect_config.get("model", "local-model"),
@@ -2219,7 +2223,7 @@ PROJECT STRUCTURE
                                 "file_code": file_code,
                                 "plan_spec": plan_spec_str,
                                 "dependency_code": dep_code,
-                                "job_spec": job_spec[:2000] if job_spec else "",
+                                "job_spec": job_spec,
                                 "config": {
                                     "model_url": reviewer_config.get("url", "http://localhost:1233/v1"),
                                     "model_name": reviewer_config.get("model", "local-model"),
@@ -2511,7 +2515,7 @@ Be specific and reference actual code from the project."""
                         "model_name": clarifier_config.get("model", "local-model"),
                         "api_type": clarifier_config.get("api_type", "openai"),
                         "temperature": 0.7,
-                        "max_tokens": 2000,
+                        "max_tokens": clarifier_config.get("max_tokens", 25000),
                         "timeout": clarifier_config.get("timeout", 300)
                     }
                 }

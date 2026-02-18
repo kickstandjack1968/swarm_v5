@@ -279,16 +279,18 @@ Output ONLY the YAML."""
     FINALIZE_PROMPT = """You are an expert software architect FINALIZING a plan based on a coder's review.
 
 The coder reviewed your draft plan and provided feedback. Adjust accordingly.
+The ORIGINAL REQUIREMENTS will be provided — your final plan MUST cover all of them.
 
 RULES:
-1. Address every concern the coder raised
-2. If the coder suggests structural changes, adopt them if reasonable
-3. If you disagree with the coder, explain why in a YAML comment
-4. The plan must still use the same YAML format (with needs_from, NOT imports_from)
-5. Output the COMPLETE revised YAML plan
-6. Config/settings/dataclass files MUST list ALL their fields in requirements
+1. Verify the final plan covers ALL original requirements — do not drop features when addressing feedback
+2. Address every concern the coder raised
+3. If the coder suggests structural changes, adopt them if reasonable
+4. If you disagree with the coder, explain why in a YAML comment
+5. The plan must still use the same YAML format (with needs_from, NOT imports_from)
+6. Output the COMPLETE revised YAML plan
+7. Config/settings/dataclass files MUST list ALL their fields in requirements
    Example: "Dataclass with fields: log_dirs (list[str]), max_file_size (int, default 10MB), encoding (str, default 'utf-8')"
-7. Every class export MUST have a `methods:` block — NOT a description string with method names.
+8. Every class export MUST have a `methods:` block — NOT a description string with method names.
    The `methods:` block is machine-read and drives coder prompts. Description strings are ignored.
    BAD:  description: "Parses logs. Methods: parse_file(path) -> list[dict]"   ← IGNORED
    GOOD:
@@ -299,11 +301,11 @@ RULES:
        discover:
          args: ["self", "dirs: list[str]"]
          returns: "list[Path]"
-8. Cross-check: for every method a file calls on a dependency, verify that method exists in the
+9. Cross-check: for every method a file calls on a dependency, verify that method exists in the
    dependency's `methods:` block with matching argument names and return type.
-9. main.py and other entry points MUST list exact method calls in requirements:
-   BAD:  "Initialize and run the processor"
-   GOOD: "Initialize Processor(settings), call processor.run(input_path) -> dict, print result" """
+10. main.py and other entry points MUST list exact method calls in requirements:
+    BAD:  "Initialize and run the processor"
+    GOOD: "Initialize Processor(settings), call processor.run(input_path) -> dict, print result" """
     
     def process(self, input_data: dict) -> dict:
         """Generate YAML execution plan."""
@@ -334,14 +336,18 @@ RULES:
         return self._parse_and_validate(response)
 
     def _process_finalize(self, input_data: dict) -> dict:
-        """Finalize plan mode — receives draft_plan + coder_feedback, produces final YAML plan."""
+        """Finalize plan mode — receives draft_plan + coder_feedback + job_spec, produces final YAML plan."""
         draft_plan = input_data.get("draft_plan", "")
         coder_feedback = input_data.get("coder_feedback", "")
+        job_spec = input_data.get("job_spec", "")
 
         if not draft_plan:
             return {"status": "error", "ok": False, "error": "No draft_plan provided for finalize mode"}
 
-        user_prompt = f"""DRAFT PLAN:
+        job_spec_section = f"\nORIGINAL REQUIREMENTS (verify your final plan covers ALL of these):\n{job_spec}\n" if job_spec else ""
+
+        user_prompt = f"""{job_spec_section}
+DRAFT PLAN:
 ```yaml
 {draft_plan}
 ```
@@ -349,7 +355,8 @@ RULES:
 CODER'S REVIEW:
 {coder_feedback}
 
-Revise the plan based on the coder's feedback. Output the COMPLETE revised YAML plan:"""
+Revise the plan based on the coder's feedback. Ensure the final plan still covers ALL original requirements.
+Output the COMPLETE revised YAML plan:"""
 
         messages = [
             {"role": "system", "content": self.FINALIZE_PROMPT},

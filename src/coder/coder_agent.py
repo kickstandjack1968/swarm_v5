@@ -94,6 +94,8 @@ Your job is to catch problems that will cause issues during implementation.
 DO NOT write any code. Output ONLY your review.
 
 REVIEW FOR:
+0. Does this plan cover ALL the original requirements? Flag any requirement that has no corresponding
+   file or implementation. This is the most important check.
 1. Are file responsibilities clear and non-overlapping?
 2. Are dependencies between files reasonable? Any circular risks?
 3. Are exports sufficient for the files that need them?
@@ -185,14 +187,18 @@ Output ONLY the file contents. No explanations before or after."""
         if not plan_yaml:
             return {"status": "error", "error": "No plan_yaml provided for plan_review mode"}
 
-        user_message = f"Review this architecture plan:\n\n```yaml\n{plan_yaml}\n```"
+        job_spec = input_data.get("job_spec", "")
+        max_tokens = input_data.get("config", {}).get("max_tokens", 25000)
+
+        job_spec_section = f"\nORIGINAL REQUIREMENTS:\n{job_spec}\n" if job_spec else ""
+        user_message = f"{job_spec_section}\nReview this architecture plan:\n\n```yaml\n{plan_yaml}\n```"
 
         messages = [
             {"role": "system", "content": self.PLAN_REVIEW_PROMPT},
             {"role": "user", "content": user_message}
         ]
 
-        response = self.call_llm(messages, temperature=0.3, max_tokens=4000)
+        response = self.call_llm(messages, temperature=0.3, max_tokens=max_tokens)
         cleaned = self.clean_response(response)
 
         return {
