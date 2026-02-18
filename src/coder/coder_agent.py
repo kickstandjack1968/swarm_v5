@@ -109,7 +109,15 @@ REVIEW FOR:
    Check: does the entry point's requirements list the EXACT method calls it will make?
    e.g. "call processor.run(input_path) -> dict" not just "run the processor"
    If the entry point requirements are vague, flag it — the coder will invent wrong method names.
-8. Is this over-engineered for what's being asked?
+8. Are return types sufficient for callers?
+   CRITICAL: For every method, check if the declared return type is rich enough for how callers will use it.
+   BAD: shadow_test() -> bool, but entry point needs to log the REASON on failure
+        (caller will write result['reason'] which crashes on a bool)
+   GOOD: shadow_test() -> dict  # {'passed': bool, 'reason': str}
+   Rule: if a method can fail AND callers need to know why, return type must be dict (not bool/None).
+   Rule: if a caller uses the return value as result['key'], the return type MUST be dict, not a primitive.
+   Cross-check each method's `returns:` against how the ENTRY POINT's requirements describe using it.
+9. Is this over-engineered for what's being asked?
 
 OUTPUT FORMAT:
 PLAN REVIEW:
