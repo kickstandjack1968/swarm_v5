@@ -707,6 +707,7 @@ class PlanExecutor:
                 init_arg_names = []
                 class_attrs = set()
                 methods = set()
+                has_init = False
 
                 for item in node.body:
                     # Collect methods
@@ -714,6 +715,7 @@ class PlanExecutor:
                         if not (item.name.startswith('__') and item.name.endswith('__') and item.name != '__init__'):
                             methods.add(item.name)
                         if item.name == '__init__':
+                            has_init = True
                             # Count args excluding self
                             args = item.args
                             all_args = [a.arg for a in args.args if a.arg != 'self']
@@ -744,6 +746,25 @@ class PlanExecutor:
                         for target in item.targets:
                             if isinstance(target, ast.Name):
                                 class_attrs.add(target.id)
+
+                # Dataclass auto-init detection
+                if not has_init:
+                    is_dataclass = any(
+                        (isinstance(d, ast.Name) and d.id == 'dataclass') or
+                        (isinstance(d, ast.Call) and isinstance(d.func, ast.Name) and d.func.id == 'dataclass') or
+                        (isinstance(d, ast.Attribute) and d.attr == 'dataclass')
+                        for d in node.decorator_list
+                    )
+                    if is_dataclass:
+                        dc_fields = []
+                        dc_required = 0
+                        for item in node.body:
+                            if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                                dc_fields.append(item.target.id)
+                                if item.value is None:  # No default value
+                                    dc_required += 1
+                        init_arg_names = dc_fields
+                        init_args = dc_required
 
                 # Methods are also accessible as attributes
                 class_attrs.update(methods)
@@ -787,6 +808,79 @@ class PlanExecutor:
                                 f"Phantom import: 'from {'.' * node.level}{node.module}' — "
                                 f"module '{base_mod}' not found in project files"
                             )
+
+        # --- Section 4: Map self.X → type name per class ---
+        self_type_map = {}  # Maps (class_name, attr_name) → type_name
+        for cls_node in ast.iter_child_nodes(tree):
+            if not isinstance(cls_node, ast.ClassDef):
+                continue
+            for item in cls_node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == '__init__':
+                    # Build param_types from annotations
+                    param_types = {}
+                    for arg in item.args.args:
+                        if arg.arg == 'self':
+                            continue
+                        if arg.annotation:
+                            if isinstance(arg.annotation, ast.Name):
+                                param_types[arg.arg] = arg.annotation.id
+                            elif isinstance(arg.annotation, ast.Attribute):
+                                param_types[arg.arg] = arg.annotation.attr
+                    # Find self.X = param and self.X = ClassName(...) assignments
+                    for stmt in ast.walk(item):
+                        if isinstance(stmt, ast.Assign):
+                            for target in stmt.targets:
+                                if (isinstance(target, ast.Attribute) and
+                                        isinstance(target.value, ast.Name) and
+                                        target.value.id == 'self'):
+                                    attr_name = target.attr
+                                    if isinstance(stmt.value, ast.Name) and stmt.value.id in param_types:
+                                        self_type_map[(cls_node.name, attr_name)] = param_types[stmt.value.id]
+                                    elif (isinstance(stmt.value, ast.Call) and
+                                          isinstance(stmt.value.func, ast.Name) and
+                                          stmt.value.func.id in dep_classes):
+                                        self_type_map[(cls_node.name, attr_name)] = stmt.value.func.id
+
+        # --- Section 5: Validate self.X.Y attribute access ---
+        seen_attr_issues = set()
+        for cls_node in ast.iter_child_nodes(tree):
+            if not isinstance(cls_node, ast.ClassDef):
+                continue
+            for node in ast.walk(cls_node):
+                if (isinstance(node, ast.Attribute) and
+                        isinstance(node.value, ast.Attribute) and
+                        isinstance(node.value.value, ast.Name) and
+                        node.value.value.id == 'self'):
+                    x_attr = node.value.attr
+                    y_attr = node.attr
+                    key = (cls_node.name, x_attr)
+                    if key in self_type_map:
+                        type_name = self_type_map[key]
+                        if type_name in dep_classes:
+                            known_attrs = dep_classes[type_name]['class_attributes']
+                            if y_attr not in known_attrs:
+                                issue_key = (x_attr, y_attr, type_name)
+                                if issue_key not in seen_attr_issues:
+                                    seen_attr_issues.add(issue_key)
+                                    issues.append(
+                                        f"self.{x_attr}.{y_attr} — '{y_attr}' not found in "
+                                        f"{type_name} (available: {', '.join(sorted(known_attrs)[:15])})"
+                                    )
+
+        # --- Section 6: Validate constructor keyword args ---
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id in dep_classes:
+                cls_name = node.func.id
+                cls_info = dep_classes[cls_name]
+                for kw in node.keywords:
+                    if kw.arg and kw.arg not in cls_info['init_arg_names']:
+                        issues.append(
+                            f"Constructor {cls_name}(... {kw.arg}=...) — "
+                            f"'{kw.arg}' is not a parameter of __init__ "
+                            f"(params: {', '.join(cls_info['init_arg_names'])})"
+                        )
 
         return issues
     
