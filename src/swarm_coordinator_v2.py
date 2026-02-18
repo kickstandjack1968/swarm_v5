@@ -2294,10 +2294,15 @@ PROJECT STRUCTURE
                                             print(f"    → {ifname}: {iss}")
                                     for ifname, iissues in integration_issues.items():
                                         issue_text = "\n".join(f"- {iss}" for iss in iissues[:10])
-                                        per_file_results[ifname] = {
-                                            "status": "FAIL",
-                                            "result": f"STATUS: FAIL\nISSUES (cross-file integration):\n{issue_text}"
-                                        }
+                                        if ifname in per_file_results:
+                                            # Merge with existing LLM feedback — don't overwrite it
+                                            per_file_results[ifname]["status"] = "FAIL"
+                                            per_file_results[ifname]["result"] += f"\n\nINTEGRATION ISSUES (cross-file):\n{issue_text}"
+                                        else:
+                                            per_file_results[ifname] = {
+                                                "status": "FAIL",
+                                                "result": f"STATUS: FAIL\nISSUES (cross-file integration):\n{issue_text}"
+                                            }
                                         if ifname not in failed_files:
                                             failed_files.append(ifname)
                                     task.metadata["needs_revision"] = True
