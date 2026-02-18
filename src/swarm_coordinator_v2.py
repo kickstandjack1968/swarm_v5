@@ -3182,7 +3182,7 @@ Be specific and reference actual code from the project."""
                 "model_name": clarifier_config.get("model", "local-model"),
                 "api_type": clarifier_config.get("api_type", "openai"),
                 "temperature": 0.7,
-                "max_tokens": 3000,
+                "max_tokens": clarifier_config.get("max_tokens", 25000),
                 "timeout": clarifier_config.get("timeout", 300)
             }
         }
