@@ -483,9 +483,9 @@ class AgentExecutor:
         self.metrics: Dict[str, AgentMetrics] = {}
         self.metrics_lock = Lock()
         
-    def _get_agent_config(self, role: AgentRole) -> Dict:
+    def _get_agent_config(self, role) -> Dict:
         """Get configuration for specific agent role"""
-        role_str = role.value
+        role_str = role.value if hasattr(role, 'value') else str(role)
         mode = self.config['model_config']['mode']
         
         if mode == 'multi' and role_str in self.config['model_config']['multi_model']:
@@ -571,27 +571,30 @@ class AgentExecutor:
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             raise Exception(f"Invalid API response format: {str(e)}")
     
-    def execute_agent(self, role: AgentRole, system_prompt: str, user_message: str, 
+    def execute_agent(self, role, system_prompt: str, user_message: str,
                       agent_params: Optional[Dict] = None) -> str:
         """Execute a single agent with the given prompts"""
-        
+
+        # Normalize role to string for dict lookups
+        role_str = role.value if hasattr(role, 'value') else str(role)
+
         # Get agent configuration
         agent_config = self._get_agent_config(role)
         url = agent_config['url']
         model = agent_config.get('model', 'local-model')
         api_type = agent_config.get('api_type', 'openai')
         timeout = agent_config.get('timeout', 7200)
-        
+
         # Merge parameters
-        params = self.config.get('agent_parameters', {}).get(role.value, {}).copy()
+        params = self.config.get('agent_parameters', {}).get(role_str, {}).copy()
         if agent_params:
             params.update(agent_params)
-        
+
         # Initialize metrics if needed
-        agent_key = role.value
+        agent_key = role_str
         with self.metrics_lock:
             if agent_key not in self.metrics:
-                self.metrics[agent_key] = AgentMetrics(agent_name=agent_key, role=role.value)
+                self.metrics[agent_key] = AgentMetrics(agent_name=agent_key, role=role_str)
         
         # Execute the call
         start_time = time.time()
@@ -609,7 +612,7 @@ class AgentExecutor:
             return response
             
         except Exception as e:
-            raise Exception(f"Agent {role.value} failed: {str(e)}")
+            raise Exception(f"Agent {role_str} failed: {str(e)}")
             
         finally:
             elapsed = time.time() - start_time

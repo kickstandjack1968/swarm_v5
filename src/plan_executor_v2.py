@@ -1305,21 +1305,38 @@ You MUST fix this issue. The plan requires specific exports.
 
         from swarm_coordinator_v2 import AgentRole
 
-        # Define coder sequence - each gets a try with different "thinking style"
-        coder_sequence = [
-            AgentRole.CODER,           # qwen3-coder:30b - Main workhorse
-            AgentRole.FALLBACK_CODER,  # qwen2.5-coder:32b - Proven alternative
-            "coder_2",                 # wizardcoder:33b - Code specialist
-            "coder_3",                 # codellama:34b - Reliable
-            "coder_4",                 # deepseek-coder-33b - Different perspective
+        # Build coder sequence from config — only include distinct models
+        multi_model = self.executor.config.get('model_config', {}).get('multi_model', {})
+        coder_sequence = []
+        seen_models = set()
+
+        # Ordered candidates: primary coder first, then fallback, then extras
+        candidates = [
+            (AgentRole.CODER, 'coder'),
+            (AgentRole.FALLBACK_CODER, 'fallback_coder'),
         ]
+        # Discover extra coders from config (coder_2, coder_3, ...)
+        for key in sorted(multi_model.keys()):
+            if key.startswith('coder_') and key not in ('coder',):
+                candidates.append((key, key))
+
+        for role, config_key in candidates:
+            config_entry = multi_model.get(config_key, {})
+            model_name = config_entry.get('model', '')
+            if model_name and model_name not in seen_models:
+                seen_models.add(model_name)
+                coder_sequence.append((role, model_name))
+
+        if not coder_sequence:
+            # Absolute fallback — at least try the primary coder
+            coder_sequence = [(AgentRole.CODER, 'unknown')]
 
         for attempt in range(self.max_file_revisions):
-            # Pick coder for this attempt
+            # Pick coder for this attempt (stay on last if exhausted)
             coder_idx = min(attempt, len(coder_sequence) - 1)
-            role = coder_sequence[coder_idx]
+            role, model_name = coder_sequence[coder_idx]
 
-            self.logger.info(f"Revision attempt {attempt + 1}/{self.max_file_revisions} for {file_spec.name} using {role}")
+            self.logger.info(f"Revision attempt {attempt + 1}/{self.max_file_revisions} for {file_spec.name} using {role} ({model_name})")
 
             # Categorize issues for targeted fixes
             issues = result.plan_compliance.get('issues', [])
