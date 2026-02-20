@@ -1162,44 +1162,115 @@ PROJECT STRUCTURE
     
     def _parse_multi_file_output(self, code_output: str) -> Dict[str, str]:
         """Parse coder output that contains multiple files."""
-    
+        files = {}
+        
         # Pattern 1: ### FILE: filename.py ###
         file_pattern = r'###\s*FILE:\s*([^\s#]+)\s*###'
         matches = list(re.finditer(file_pattern, code_output))
+        
+        if matches:
+            for i, match in enumerate(matches):
+                filename = match.group(1).strip()
+                start_pos = match.end()
+                
+                # Find end position (start of next file or end of string)
+                if i + 1 < len(matches):
+                    end_pos = matches[i + 1].start()
+                else:
+                    end_pos = len(code_output)
+                
+                content = code_output[start_pos:end_pos].strip()
+                content = self._clean_file_content(content)
+                
+                if content:
+                    files[filename] = content
+            return files
     
         # Pattern 2: #### File: `filename.py` ... ```python ... ```
-        # More robust version handles case variations and optional language markers
-        if not matches:
-            md_pattern = r'#{1,4}\s*[Ff]ile:\s*`([^`]+)`.*?\n\s*```(?:python|py)?\s*\n(.*?)```'
-            md_matches = list(re.finditer(md_pattern, code_output, re.DOTALL))
-            if md_matches:
-                files = {}
-                for match in md_matches:
-                    filename = match.group(1).strip()
-                    content = match.group(2).strip()
-                    if content:
-                        files[filename] = content
+        md_pattern = r'#{1,4}\s*[Ff]ile:\s*`([^`]+)`.*?\n\s*```(?:python|py)?\s*\n(.*?)```'
+        md_matches = list(re.finditer(md_pattern, code_output, re.DOTALL))
+        if md_matches:
+            for match in md_matches:
+                filename = match.group(1).strip()
+                content = match.group(2).strip()
+                if content:
+                    files[filename] = content
+            if files:
                 return files
-    
-        if not matches:
-            return {}  # Single file output
-    
-        files = {}
-        for i, match in enumerate(matches):
-            filename = match.group(1).strip()
+        
+        # Pattern 3: **filename.py** or ==filename.py== (bold/underline markers)
+        bold_pattern = r'\*{2}(\w+\.py)\*{2}|==(\w+\.py)=='
+        bold_matches = list(re.finditer(bold_pattern, code_output))
+        if bold_matches:
+            for match in bold_matches:
+                filename = match.group(1) or match.group(2)
+                start_pos = match.end()
+                # Find next bold or end
+                next_match = re.search(r'\*{2}\w+\.py\*{2}|==\w+\.py==', code_output[start_pos:])
+                if next_match:
+                    end_pos = start_pos + next_match.start()
+                else:
+                    end_pos = len(code_output)
+                content = code_output[start_pos:end_pos].strip()
+                content = self._clean_file_content(content)
+                if content:
+                    files[filename] = content
+            if files:
+                return files
+        
+        # Pattern 4: filename.py: (followed by code)
+        colon_pattern = r'^(\w+\.py):\s*\n'
+        for match in re.finditer(colon_pattern, code_output, re.MULTILINE):
+            filename = match.group(1)
             start_pos = match.end()
-            
-            # Find end position (start of next file or end of string)
-            if i + 1 < len(matches):
-                end_pos = matches[i + 1].start()
+            # Find next filename.py: or end
+            next_match = re.search(r'^(\w+\.py):\s*\n', code_output[start_pos:], re.MULTILINE)
+            if next_match:
+                end_pos = start_pos + next_match.start()
             else:
                 end_pos = len(code_output)
-            
             content = code_output[start_pos:end_pos].strip()
-            
-            # Clean any remaining markdown artifacts
             content = self._clean_file_content(content)
-            
+            if content:
+                files[filename] = content
+        if files:
+            return files
+        
+        # Pattern 5: --- filename.py --- or === filename.py ===
+        dash_pattern = r'^[-=]{3}\s*(\w+\.py)\s*[-=]{3}'
+        for match in re.finditer(dash_pattern, code_output, re.MULTILINE):
+            filename = match.group(1)
+            start_pos = match.end()
+            next_match = re.search(r'^[-=]{3}\s*\w+\.py\s*[-=]{3}', code_output[start_pos:], re.MULTILINE)
+            if next_match:
+                end_pos = start_pos + next_match.start()
+            else:
+                end_pos = len(code_output)
+            content = code_output[start_pos:end_pos].strip()
+            content = self._clean_file_content(content)
+            if content:
+                files[filename] = content
+        if files:
+            return files
+        
+        # Pattern 6: File: filename.py (no backticks, just plain text)
+        plain_pattern = r'^File:\s*(\w+\.py)\s*$'
+        for match in re.finditer(plain_pattern, code_output, re.MULTILINE):
+            filename = match.group(1)
+            start_pos = match.end()
+            # Skip to next non-empty line that starts code
+            next_line_match = re.search(r'^(\w|\"|\'|import|from|class|def|#)', code_output[start_pos:], re.MULTILINE)
+            if next_line_match:
+                code_start = start_pos + next_line_match.start()
+            else:
+                code_start = start_pos
+            next_file_match = re.search(r'^File:\s*\w+\.py\s*$', code_output[code_start:], re.MULTILINE)
+            if next_file_match:
+                end_pos = code_start + next_file_match.start()
+            else:
+                end_pos = len(code_output)
+            content = code_output[code_start:end_pos].strip()
+            content = self._clean_file_content(content)
             if content:
                 files[filename] = content
         
@@ -1803,23 +1874,41 @@ PROJECT STRUCTURE
                 "cmd": "pytest (docker)"
             }
 
-            # 3. Run CLI Help in Docker
+            # 3. Run CLI Help in Docker (skip for interactive programs without argparse/click/typer)
             entry_point = self.state.get("project_info", {}).get("entry_point", "src/main.py")
-            # Convert src/main.py -> src.main
-            module_path = entry_point.replace("/", ".").replace("\\", ".").rstrip(".py")
-            if module_path.endswith("."): module_path = module_path[:-1]
-            if not module_path.startswith("src."): module_path = f"src.{module_path}"
+            entry_path = os.path.join(project_dir, entry_point)
+            has_cli_framework = False
+            try:
+                with open(entry_path, "r") as f:
+                    entry_code = f.read()
+                has_cli_framework = any(fw in entry_code for fw in ("argparse", "click", "typer"))
+            except Exception:
+                has_cli_framework = True  # If we can't read, run the test anyway
 
-            cli_res = self.sandbox._exec(
-                ["python", "-m", module_path, "--help"],
-                timeout=10
-            )
-            results["cli_help"] = {
-                "returncode": cli_res.returncode,
-                "stdout": cli_res.stdout,
-                "stderr": cli_res.stderr,
-                "cmd": f"python -m {module_path} --help (docker)"
-            }
+            if has_cli_framework:
+                # Convert src/main.py -> src.main
+                module_path = entry_point.replace("/", ".").replace("\\", ".").rstrip(".py")
+                if module_path.endswith("."): module_path = module_path[:-1]
+                if not module_path.startswith("src."): module_path = f"src.{module_path}"
+
+                cli_res = self.sandbox._exec(
+                    ["python", "-m", module_path, "--help"],
+                    timeout=10
+                )
+                results["cli_help"] = {
+                    "returncode": cli_res.returncode,
+                    "stdout": cli_res.stdout,
+                    "stderr": cli_res.stderr,
+                    "cmd": f"python -m {module_path} --help (docker)"
+                }
+            else:
+                print("   ℹ Skipping cli_help: entry point has no argparse/click/typer")
+                results["cli_help"] = {
+                    "returncode": 0,
+                    "stdout": "SKIPPED: interactive program without argparse/click/typer",
+                    "stderr": "",
+                    "cmd": f"cli_help skipped (no CLI framework in {entry_point})"
+                }
 
             return results
 
@@ -1848,26 +1937,44 @@ PROJECT STRUCTURE
         except Exception as e:
             results["pytest"] = {"returncode": -1, "stderr": str(e), "cmd": "pytest -q"}
 
-        # Run CLI Help
+        # Run CLI Help (skip for interactive programs without argparse/click/typer)
         try:
             entry_point = self.state.get("project_info", {}).get("entry_point", "src/main.py")
-            module_path = entry_point.replace("/", ".").replace("\\", ".").rstrip(".py")
-            if module_path.endswith("."): module_path = module_path[:-1]
-            
-            # Patch 3 Logic: Ensure src. prefix
-            if os.path.exists(os.path.join(project_dir, "src")) and not module_path.startswith("src."):
-                 module_path = f"src.{module_path}"
-            
-            res = subprocess.run(
-                [sys.executable, "-m", module_path, "--help"],
-                cwd=project_dir, env=env, capture_output=True, text=True, timeout=10
-            )
-            results["cli_help"] = {
-                "returncode": res.returncode, 
-                "stdout": res.stdout, 
-                "stderr": res.stderr, 
-                "cmd": f"python -m {module_path} --help"
-            }
+            entry_path = os.path.join(project_dir, entry_point)
+            has_cli_framework = False
+            try:
+                with open(entry_path, "r") as f:
+                    entry_code = f.read()
+                has_cli_framework = any(fw in entry_code for fw in ("argparse", "click", "typer"))
+            except Exception:
+                has_cli_framework = True  # If we can't read, run the test anyway
+
+            if has_cli_framework:
+                module_path = entry_point.replace("/", ".").replace("\\", ".").rstrip(".py")
+                if module_path.endswith("."): module_path = module_path[:-1]
+
+                # Patch 3 Logic: Ensure src. prefix
+                if os.path.exists(os.path.join(project_dir, "src")) and not module_path.startswith("src."):
+                     module_path = f"src.{module_path}"
+
+                res = subprocess.run(
+                    [sys.executable, "-m", module_path, "--help"],
+                    cwd=project_dir, env=env, capture_output=True, text=True, timeout=10
+                )
+                results["cli_help"] = {
+                    "returncode": res.returncode,
+                    "stdout": res.stdout,
+                    "stderr": res.stderr,
+                    "cmd": f"python -m {module_path} --help"
+                }
+            else:
+                print("   ℹ Skipping cli_help: entry point has no argparse/click/typer")
+                results["cli_help"] = {
+                    "returncode": 0,
+                    "stdout": "SKIPPED: interactive program without argparse/click/typer",
+                    "stderr": "",
+                    "cmd": f"cli_help skipped (no CLI framework in {entry_point})"
+                }
         except Exception as e:
             results["cli_help"] = {"returncode": -1, "stderr": str(e), "cmd": "cli_help check"}
             
@@ -2179,6 +2286,17 @@ PROJECT STRUCTURE
                 reviewer_config = self.executor._get_agent_config(AgentRole.REVIEWER)
                 job_spec = self.state["context"].get("job_spec", self.state["context"].get("job_scope", ""))
 
+                # Build reviewer list: primary + fallback (reviewer_2) if configured
+                reviewer_configs = [("primary", reviewer_config)]
+                try:
+                    multi_model = self.config.get('model_config', {}).get('multi_model', {})
+                    rc2 = multi_model.get('reviewer_2', {})
+                    if rc2 and rc2.get("url"):
+                        reviewer_configs.append(("fallback", rc2))
+                        print(f"  → Dual reviewer: {reviewer_config.get('model', '?')} + {rc2.get('model', '?')}")
+                except Exception:
+                    pass
+
                 # Try file-by-file compliance review
                 use_file_by_file = False
                 parsed_plan = None
@@ -2214,107 +2332,152 @@ PROJECT STRUCTURE
                                 print(f"    {fname}: FAIL (missing)")
                                 continue
 
+                            # Try each reviewer (primary, then fallback) per file.
+                            # If primary crashes or errors, fallback gets a chance before marking FAIL.
                             plan_spec_str = self._build_file_plan_spec_string(file_spec)
                             dep_code = self._build_dependency_code_for_review(file_spec, all_files)
 
-                            payload = {
-                                "mode": "compliance_file",
-                                "file_name": fname,
-                                "file_code": file_code,
-                                "plan_spec": plan_spec_str,
-                                "dependency_code": dep_code,
-                                "job_spec": job_spec,
-                                "config": {
-                                    "model_url": reviewer_config.get("url", "http://localhost:1233/v1"),
-                                    "model_name": reviewer_config.get("model", "local-model"),
-                                    "api_type": reviewer_config.get("api_type", "openai"),
-                                    "temperature": 0.3,
-                                    "max_tokens": reviewer_config.get("max_tokens", 12000),
-                                    "timeout": reviewer_config.get("timeout", 600)
-                                }
-                            }
+                            result_text = None
+                            used_reviewer = "primary"
 
-                            self._log_prompt(f"COMPLIANCE_FILE_{fname}", "REVIEWER", {
-                                "system_prompt": "FILE_COMPLIANCE_PROMPT",
-                                "user_message": f"Review {fname}",
-                                "file_code": file_code[:2000],
-                                "plan_spec": plan_spec_str
-                            }, mode="compliance_file")
+                            for reviewer_label, rc in reviewer_configs:
+                                try:
+                                    payload = {
+                                        "mode": "compliance_file",
+                                        "file_name": fname,
+                                        "file_code": file_code,
+                                        "plan_spec": plan_spec_str,
+                                        "dependency_code": dep_code,
+                                        "job_spec": job_spec,
+                                        "config": {
+                                            "model_url": rc.get("url", "http://localhost:1233/v1"),
+                                            "model_name": rc.get("model", "local-model"),
+                                            "api_type": rc.get("api_type", "openai"),
+                                            "temperature": 0.3,
+                                            "max_tokens": rc.get("max_tokens", 12000),
+                                            "timeout": rc.get("timeout", 600)
+                                        }
+                                    }
 
-                            output = self._run_external_agent("reviewer", payload)
+                                    self._log_prompt(f"COMPLIANCE_FILE_{fname}_{reviewer_label}", "REVIEWER", {
+                                        "system_prompt": "FILE_COMPLIANCE_PROMPT",
+                                        "user_message": f"Review {fname}",
+                                        "file_code": file_code[:2000],
+                                        "plan_spec": plan_spec_str,
+                                        "reviewer_model": rc.get("model", "?")
+                                    }, mode="compliance_file")
 
-                            if output.get("status") == "error":
-                                per_file_results[fname] = {"status": "FAIL", "result": output.get("error", "Agent error")}
+                                    output = self._run_external_agent("reviewer", payload)
+
+                                    if output.get("status") == "error":
+                                        print(f"    {fname}: {reviewer_label} ({rc.get('model','?')}) error, trying next...")
+                                        continue
+
+                                    result_text = output.get("result", "")
+                                    if not result_text or not result_text.strip():
+                                        print(f"    {fname}: {reviewer_label} ({rc.get('model','?')}) empty response, trying next...")
+                                        result_text = None
+                                        continue
+
+                                    used_reviewer = reviewer_label
+                                    break  # Got a response — stop trying reviewers
+
+                                except Exception as rev_err:
+                                    print(f"    {fname}: {reviewer_label} ({rc.get('model','?')}) crashed ({rev_err}), trying next...")
+                                    continue
+
+                            # All reviewers failed for this file
+                            if result_text is None:
+                                per_file_results[fname] = {"status": "FAIL", "result": "All reviewers failed for this file"}
                                 failed_files.append(fname)
-                                print(f"    {fname}: FAIL (agent error)")
+                                all_results_text.append(f"- {fname}: FAIL (all reviewers failed)")
+                                print(f"    {fname}: FAIL (all reviewers failed)")
                                 continue
-
-                            result_text = output.get("result", "")
 
                             # Cap issues to 10 per file to prevent revision prompt flooding
                             result_text = self._cap_reviewer_issues(result_text, max_issues=10)
 
+                            reviewer_tag = f" [{used_reviewer}]" if used_reviewer != "primary" else ""
                             self._log_prompt(f"COMPLIANCE_FILE_{fname}_RESULT", "REVIEWER", {
                                 "system_prompt": "",
-                                "user_message": result_text
+                                "user_message": result_text,
+                                "reviewer_used": used_reviewer
                             }, mode="compliance_file_result")
 
-                            # Parse STATUS from result
+                            # Parse STATUS from result — require explicit PASS, never default to it
                             result_upper = result_text.upper()
                             if "STATUS: FAIL" in result_upper or "STATUS: NEEDS_REVISION" in result_upper:
                                 per_file_results[fname] = {"status": "FAIL", "result": result_text}
                                 failed_files.append(fname)
-                                all_results_text.append(f"- {fname}: FAIL\n{result_text}")
-                                print(f"    {fname}: FAIL")
+                                all_results_text.append(f"- {fname}: FAIL{reviewer_tag}\n{result_text}")
+                                print(f"    {fname}: FAIL{reviewer_tag}")
+                            elif "STATUS: PASS" in result_upper:
+                                # Coherence check: does the review actually mention the file?
+                                base_name = fname.rsplit('/', 1)[-1].replace('.py', '')
+                                export_names = [e.name for e in (file_spec.exports or [])]
+                                coherence_terms = [fname, base_name] + export_names
+                                mentions_file = any(term.lower() in result_text.lower() for term in coherence_terms if term)
+                                if mentions_file:
+                                    per_file_results[fname] = {"status": "PASS", "result": result_text}
+                                    all_results_text.append(f"- {fname}: PASS{reviewer_tag}")
+                                    print(f"    {fname}: PASS{reviewer_tag}")
+                                else:
+                                    per_file_results[fname] = {"status": "FAIL", "result": f"Review output did not reference the file or its exports — likely hallucinated. Raw output:\n{result_text[:500]}"}
+                                    failed_files.append(fname)
+                                    all_results_text.append(f"- {fname}: FAIL (hallucinated review){reviewer_tag}")
+                                    print(f"    {fname}: FAIL (hallucinated review — no mention of {fname} or exports){reviewer_tag}")
                             else:
-                                per_file_results[fname] = {"status": "PASS", "result": result_text}
-                                all_results_text.append(f"- {fname}: PASS")
-                                print(f"    {fname}: PASS")
+                                # No explicit STATUS found — treat as FAIL
+                                per_file_results[fname] = {"status": "FAIL", "result": f"Reviewer did not produce a STATUS: PASS or STATUS: FAIL. Raw output:\n{result_text[:500]}"}
+                                failed_files.append(fname)
+                                all_results_text.append(f"- {fname}: FAIL (no STATUS found){reviewer_tag}")
+                                print(f"    {fname}: FAIL (no STATUS in reviewer output){reviewer_tag}")
 
                         # Assemble overall result
                         task.result = "FILE-BY-FILE COMPLIANCE REVIEW:\n\n" + "\n\n".join(all_results_text)
 
                         if failed_files:
+                            print(f"  ⚠ Compliance review: {len(failed_files)}/{len(parsed_plan.files)} files NEED REVISION")
+                        else:
+                            print(f"  ✓ Compliance review: ALL {len(parsed_plan.files)} files APPROVED")
+
+                        # Always run AST integration check — catches cross-file bugs
+                        # (wrong attribute names, constructor arg mismatches, phantom imports)
+                        # regardless of whether LLM review passed or failed
+                        try:
+                            integration_issues = self._run_integration_check(all_files, parsed_plan)
+                            if integration_issues:
+                                total_issues = sum(len(v) for v in integration_issues.values())
+                                print(f"  ⚠ Integration check found {total_issues} cross-file issues in {len(integration_issues)} files")
+                                for ifname, iissues in integration_issues.items():
+                                    for iss in iissues[:2]:
+                                        print(f"    → {ifname}: {iss}")
+                                for ifname, iissues in integration_issues.items():
+                                    issue_text = "\n".join(f"- {iss}" for iss in iissues[:10])
+                                    if ifname in per_file_results:
+                                        # Merge with existing LLM feedback — don't overwrite it
+                                        per_file_results[ifname]["status"] = "FAIL"
+                                        per_file_results[ifname]["result"] += f"\n\nINTEGRATION ISSUES (cross-file):\n{issue_text}"
+                                    else:
+                                        per_file_results[ifname] = {
+                                            "status": "FAIL",
+                                            "result": f"STATUS: FAIL\nISSUES (cross-file integration):\n{issue_text}"
+                                        }
+                                    if ifname not in failed_files:
+                                        failed_files.append(ifname)
+                                task.result += f"\n\nINTEGRATION CHECK: {total_issues} cross-file issues in {len(integration_issues)} files"
+                                print(f"  ⚠ Integration check: {len(failed_files)} total files will be revised")
+                            else:
+                                print(f"  ✓ Integration check: no cross-file issues found")
+                        except Exception as ie:
+                            print(f"  ⚠ Integration check failed ({ie}), skipping")
+
+                        # Set revision metadata if any files failed (from LLM review or integration check)
+                        if failed_files:
                             task.metadata["needs_revision"] = True
                             task.metadata["final_plan"] = final_plan
                             task.metadata["per_file_results"] = per_file_results
                             task.metadata["failed_files"] = failed_files
-                            print(f"  ⚠ Compliance review: {len(failed_files)}/{len(parsed_plan.files)} files NEED REVISION")
-                        else:
-                            print(f"  ✓ Compliance review: ALL {len(parsed_plan.files)} files APPROVED")
-                            # Even when LLM review passes, run AST integration check
-                            # to catch cross-file bugs the LLM misses (wrong method names, constructor args)
-                            try:
-                                integration_issues = self._run_integration_check(all_files, parsed_plan)
-                                if integration_issues:
-                                    total_issues = sum(len(v) for v in integration_issues.values())
-                                    print(f"  ⚠ Integration check found {total_issues} cross-file issues in {len(integration_issues)} files")
-                                    for ifname, iissues in integration_issues.items():
-                                        for iss in iissues[:2]:
-                                            print(f"    → {ifname}: {iss}")
-                                    for ifname, iissues in integration_issues.items():
-                                        issue_text = "\n".join(f"- {iss}" for iss in iissues[:10])
-                                        if ifname in per_file_results:
-                                            # Merge with existing LLM feedback — don't overwrite it
-                                            per_file_results[ifname]["status"] = "FAIL"
-                                            per_file_results[ifname]["result"] += f"\n\nINTEGRATION ISSUES (cross-file):\n{issue_text}"
-                                        else:
-                                            per_file_results[ifname] = {
-                                                "status": "FAIL",
-                                                "result": f"STATUS: FAIL\nISSUES (cross-file integration):\n{issue_text}"
-                                            }
-                                        if ifname not in failed_files:
-                                            failed_files.append(ifname)
-                                    task.metadata["needs_revision"] = True
-                                    task.metadata["final_plan"] = final_plan
-                                    task.metadata["per_file_results"] = per_file_results
-                                    task.metadata["failed_files"] = failed_files
-                                    task.result += f"\n\nINTEGRATION CHECK: {len(failed_files)} files need cross-file revision"
-                                    print(f"  ⚠ Integration check: {len(failed_files)} files will be revised")
-                                else:
-                                    print(f"  ✓ Integration check: no cross-file issues found")
-                            except Exception as ie:
-                                print(f"  ⚠ Integration check failed ({ie}), skipping")
 
                         task.status = TaskStatus.COMPLETED
 
@@ -2324,41 +2487,55 @@ PROJECT STRUCTURE
 
                 # Fallback: monolithic compliance review (original behavior)
                 if not use_file_by_file:
-                    payload = {
-                        "mode": "compliance",
-                        "plan_yaml": final_plan,
-                        "code": latest_code,
-                        "config": {
-                            "model_url": reviewer_config.get("url", "http://localhost:1233/v1"),
-                            "model_name": reviewer_config.get("model", "local-model"),
-                            "api_type": reviewer_config.get("api_type", "openai"),
-                            "temperature": 0.3,
-                            "max_tokens": reviewer_config.get("max_tokens", 12000),
-                            "timeout": reviewer_config.get("timeout", 600)
-                        }
-                    }
-
                     self._log_prompt("COMPLIANCE", "REVIEWER", {"system_prompt": "COMPLIANCE_PROMPT", "user_message": "(plan+code)", "plan_yaml": final_plan, "code": latest_code[:2000]}, mode="compliance")
 
-                    try:
-                        output = self._run_external_agent("reviewer", payload)
-                        if output.get("status") == "error":
-                            raise Exception(output.get("error"))
+                    # Try each reviewer (primary, then fallback)
+                    result_text = None
+                    last_error = None
+                    for reviewer_label, rc in reviewer_configs:
+                        try:
+                            payload = {
+                                "mode": "compliance",
+                                "plan_yaml": final_plan,
+                                "code": latest_code,
+                                "config": {
+                                    "model_url": rc.get("url", "http://localhost:1233/v1"),
+                                    "model_name": rc.get("model", "local-model"),
+                                    "api_type": rc.get("api_type", "openai"),
+                                    "temperature": 0.3,
+                                    "max_tokens": rc.get("max_tokens", 12000),
+                                    "timeout": rc.get("timeout", 600)
+                                }
+                            }
+                            output = self._run_external_agent("reviewer", payload)
+                            if output.get("status") == "error":
+                                print(f"  ⚠ Monolithic {reviewer_label} ({rc.get('model','?')}) error, trying next...")
+                                last_error = output.get("error", "Agent error")
+                                continue
 
-                        result_text = output.get("result", "")
+                            result_text = output.get("result", "")
+                            if not result_text or not result_text.strip():
+                                print(f"  ⚠ Monolithic {reviewer_label} ({rc.get('model','?')}) empty response, trying next...")
+                                result_text = None
+                                continue
+                            break
+                        except Exception as e:
+                            print(f"  ⚠ Monolithic {reviewer_label} ({rc.get('model','?')}) crashed ({e}), trying next...")
+                            last_error = str(e)
+                            continue
+
+                    if result_text:
                         task.result = result_text
-
                         if "NEEDS_REVISION" in result_text.upper() or "STATUS: NEEDS_REVISION" in result_text.upper():
                             task.metadata["needs_revision"] = True
                             task.metadata["final_plan"] = final_plan
                             print(f"  ⚠ Compliance review: NEEDS_REVISION")
                         else:
                             print(f"  ✓ Compliance review: APPROVED")
-
                         task.status = TaskStatus.COMPLETED
-                    except Exception as e:
+                    else:
                         task.status = TaskStatus.FAILED
-                        task.error = str(e)
+                        task.error = last_error or "All reviewers failed"
 
                 task.completed_at = time.time()
                 self._update_context(task)
@@ -4503,6 +4680,31 @@ TEST REQUIREMENTS:
 - Use unittest.mock for file I/O, network calls, datetime, random, etc.
 - For databases: use temp databases or mock connections
 
+═══════════════════════════════════════════════════════════════════════════════
+INTERACTIVE INPUT - CRITICAL:
+═══════════════════════════════════════════════════════════════════════════════
+
+- NEVER call a function that uses input() without mocking it first
+- Functions like main loops, get_input(), get_number(), get_operation() call input() internally
+- If you call them without mocking, the test will HANG forever waiting for stdin
+- ALWAYS use: @unittest.mock.patch('builtins.input', side_effect=[...])
+- Example for testing an interactive function:
+    from unittest.mock import patch
+    @patch('builtins.input', side_effect=['5', '+', '3', 'n'])
+    def test_main_loop(mock_input):
+        main()  # Now input() returns '5', '+', '3', 'n' in sequence
+
+═══════════════════════════════════════════════════════════════════════════════
+METHOD VERIFICATION - CRITICAL:
+═══════════════════════════════════════════════════════════════════════════════
+
+- ONLY call methods/functions that ACTUALLY EXIST in the source code
+- Read the ACTUAL SOURCE CODE provided below carefully before writing tests
+- If a function is defined at module level (e.g. get_number()), do NOT call it as a class method (calculator.get_number())
+- If a class has methods add(), subtract(), multiply(), divide() - ONLY test those exact methods
+- Do NOT invent methods that don't exist in the source code
+- Match function signatures exactly: if get_number(prompt: str) takes a prompt, pass a string argument
+
 NAMING: test_<function>_<scenario>
 Example: test_calculate_total_with_empty_list
 
@@ -4518,6 +4720,8 @@ PRE-SUBMISSION CHECKLIST - VERIFY BEFORE RESPONDING:
 ☐ All imports use 'from src.X import Y' format
 ☐ Every test function has a body (not empty)
 ☐ Output is valid Python that can run with pytest
+☐ Every function/method I call ACTUALLY EXISTS in the source code
+☐ Any function that calls input() is mocked with @patch('builtins.input', ...)
 
 If ANY checkbox is unchecked, FIX YOUR OUTPUT before submitting.
 
