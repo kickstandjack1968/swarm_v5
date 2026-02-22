@@ -1893,7 +1893,7 @@ PROJECT STRUCTURE
 
                 cli_res = self.sandbox._exec(
                     ["python", "-m", module_path, "--help"],
-                    timeout=10
+                    timeout=30
                 )
                 results["cli_help"] = {
                     "returncode": cli_res.returncode,
@@ -1959,7 +1959,7 @@ PROJECT STRUCTURE
 
                 res = subprocess.run(
                     [sys.executable, "-m", module_path, "--help"],
-                    cwd=project_dir, env=env, capture_output=True, text=True, timeout=10
+                    cwd=project_dir, env=env, capture_output=True, text=True, timeout=30
                 )
                 results["cli_help"] = {
                     "returncode": res.returncode,
@@ -3988,11 +3988,19 @@ Be specific and reference actual code from the project."""
 
         return True
 
-    def run_workflow(self, user_request: str, workflow_type: str = "standard"):
-        """Execute a complete workflow"""
+    def run_workflow(self, user_request: str, workflow_type: str = "standard", stop_after: str = None):
+        """Execute a complete workflow.
+
+        Args:
+            stop_after: Stop after this stage completes. Valid values for collaborative:
+                        'clarify', 'draft_plan', 'plan_review', 'finalize_plan',
+                        'build', 'compliance'. If None, runs all stages.
+        """
         print("=" * 80)
         print(f"ADVANCED SWARM COORDINATOR v2")
         print(f"Workflow: {workflow_type}")
+        if stop_after:
+            print(f"Stop after: {stop_after}")
         print("=" * 80)
         
         # Start Docker sandbox if enabled
@@ -4047,7 +4055,7 @@ Be specific and reference actual code from the project."""
                 print("⚠ No tasks in bugfix workflow queue")
                 return
         elif workflow_type == "collaborative":
-            self._create_collaborative_workflow(user_request)
+            self._create_collaborative_workflow(user_request, stop_after=stop_after)
         else:
             raise ValueError(f"Unknown workflow type: {workflow_type}")
         
@@ -4310,79 +4318,81 @@ Be specific and reference actual code from the project."""
             dependencies=["T008_document"]
         ))
     
-    def _create_collaborative_workflow(self, user_request: str):
-        """Create collaborative workflow: clarify → draft plan → coder reviews → final plan → build → compliance"""
+    def _create_collaborative_workflow(self, user_request: str, stop_after: str = None):
+        """Create collaborative workflow: clarify → draft plan → coder reviews → final plan → build → compliance
 
-        # T001: Clarification (structured output)
-        self.add_task(Task(
-            task_id="T001_clarify",
-            task_type="clarification",
-            description="Clarify requirements and produce structured job spec",
-            assigned_role=AgentRole.CLARIFIER,
-            status=TaskStatus.PENDING,
-            priority=10,
-            metadata={"user_request": user_request, "output_format": "structured"}
-        ))
+        Args:
+            stop_after: Stop after this stage. Valid: 'clarify', 'draft_plan',
+                        'plan_review', 'finalize_plan', 'build', 'compliance'.
+        """
 
-        # T002: Draft Plan
-        self.add_task(Task(
-            task_id="T002_draft_plan",
-            task_type="draft_plan",
-            description="Produce draft architecture plan from job spec",
-            assigned_role=AgentRole.ARCHITECT,
-            status=TaskStatus.PENDING,
-            priority=9,
-            dependencies=["T001_clarify"],
-            metadata={"user_request": user_request}
-        ))
+        stages = [
+            ("clarify", Task(
+                task_id="T001_clarify",
+                task_type="clarification",
+                description="Clarify requirements and produce structured job spec",
+                assigned_role=AgentRole.CLARIFIER,
+                status=TaskStatus.PENDING,
+                priority=10,
+                metadata={"user_request": user_request, "output_format": "structured"}
+            )),
+            ("draft_plan", Task(
+                task_id="T002_draft_plan",
+                task_type="draft_plan",
+                description="Produce draft architecture plan from job spec",
+                assigned_role=AgentRole.ARCHITECT,
+                status=TaskStatus.PENDING,
+                priority=9,
+                dependencies=["T001_clarify"],
+                metadata={"user_request": user_request}
+            )),
+            ("plan_review", Task(
+                task_id="T003_plan_review",
+                task_type="plan_review",
+                description="Coder reviews draft plan before finalization",
+                assigned_role=AgentRole.CODER,
+                status=TaskStatus.PENDING,
+                priority=8,
+                dependencies=["T002_draft_plan"],
+                metadata={"user_request": user_request}
+            )),
+            ("finalize_plan", Task(
+                task_id="T004_final_plan",
+                task_type="finalize_plan",
+                description="Architect finalizes plan with coder feedback",
+                assigned_role=AgentRole.ARCHITECT,
+                status=TaskStatus.PENDING,
+                priority=7,
+                dependencies=["T003_plan_review"],
+                metadata={"user_request": user_request}
+            )),
+            ("build", Task(
+                task_id="T005_build",
+                task_type="build_from_plan",
+                description="Build all code from finalized plan",
+                assigned_role=AgentRole.CODER,
+                status=TaskStatus.PENDING,
+                priority=6,
+                dependencies=["T004_final_plan"],
+                metadata={"user_request": user_request}
+            )),
+            ("compliance", Task(
+                task_id="T006_compliance",
+                task_type="compliance_review",
+                description="Verify code implements the plan correctly",
+                assigned_role=AgentRole.REVIEWER,
+                status=TaskStatus.PENDING,
+                priority=5,
+                dependencies=["T005_build"],
+                metadata={"user_request": user_request}
+            )),
+        ]
 
-        # T003: Plan Review (Coder reviews the draft)
-        self.add_task(Task(
-            task_id="T003_plan_review",
-            task_type="plan_review",
-            description="Coder reviews draft plan before finalization",
-            assigned_role=AgentRole.CODER,
-            status=TaskStatus.PENDING,
-            priority=8,
-            dependencies=["T002_draft_plan"],
-            metadata={"user_request": user_request}
-        ))
-
-        # T004: Final Plan (Architect incorporates coder feedback)
-        self.add_task(Task(
-            task_id="T004_final_plan",
-            task_type="finalize_plan",
-            description="Architect finalizes plan with coder feedback",
-            assigned_role=AgentRole.ARCHITECT,
-            status=TaskStatus.PENDING,
-            priority=7,
-            dependencies=["T003_plan_review"],
-            metadata={"user_request": user_request}
-        ))
-
-        # T005: Build (Coder builds all code from final plan)
-        self.add_task(Task(
-            task_id="T005_build",
-            task_type="build_from_plan",
-            description="Build all code from finalized plan",
-            assigned_role=AgentRole.CODER,
-            status=TaskStatus.PENDING,
-            priority=6,
-            dependencies=["T004_final_plan"],
-            metadata={"user_request": user_request}
-        ))
-
-        # T006: Compliance Review
-        self.add_task(Task(
-            task_id="T006_compliance",
-            task_type="compliance_review",
-            description="Verify code implements the plan correctly",
-            assigned_role=AgentRole.REVIEWER,
-            status=TaskStatus.PENDING,
-            priority=5,
-            dependencies=["T005_build"],
-            metadata={"user_request": user_request}
-        ))
+        for stage_name, task in stages:
+            self.add_task(task)
+            if stop_after and stage_name == stop_after:
+                print(f"  ⏸ Will stop after: {stage_name}")
+                break
 
     def _create_review_workflow(self, code: str):
         """Create workflow for reviewing existing code"""
