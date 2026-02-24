@@ -10,15 +10,15 @@
     "multi_model": {
       "architect": {
         "url": "http://192.168.40.100:11434/v1",
-        "model": "qwen3:32b",
-        "model_name": "Ollama qwen3:32b (Architect - System Design)",
+        "model": "qwen3-coder:30b",
+        "model_name": "Ollama qwen3-coder:30b (Architect)",
         "api_type": "ollama",
         "timeout": 7200
       },
       "clarifier": {
         "url": "http://192.168.40.100:11434/v1",
-        "model": "qwen2.5:14b",
-        "model_name": "Ollama qwen2.5:14b (Clarifier - Fast Q&A)",
+        "model": "qwen3-coder:30b",
+        "model_name": "Ollama qwen3-coder:30b (Clarifier)",
         "api_type": "ollama",
         "timeout": 7200
       },
@@ -31,29 +31,29 @@
       },
       "verifier": {
         "url": "http://192.168.40.100:11434/v1",
-        "model": "deepseek-r1:32b",
-        "model_name": "Ollama deepseek-r1:32b (Verifier - R1 Final Check)",
+        "model": "qwen3-coder:30b",
+        "model_name": "Ollama qwen3-coder:30b (Verifier)",
         "api_type": "ollama",
         "timeout": 7200
       },
       "reviewer": {
         "url": "http://192.168.40.100:11434/v1",
-        "model": "qwen2.5-coder:32b",
-        "model_name": "Ollama qwen2.5-coder:32b (Reviewer - General Python)",
+        "model": "qwen3-coder:30b",
+        "model_name": "Ollama qwen3-coder:30b (Reviewer)",
         "api_type": "ollama",
         "timeout": 7200
       },
       "reviewer_2": {
         "url": "http://192.168.40.100:11434/v1",
-        "model": "deepseek-r1:32b",
-        "model_name": "Ollama deepseek-r1:32b (Reviewer 2 - Logic/Control Flow)",
+        "model": "qwen3-coder:30b",
+        "model_name": "Ollama qwen3-coder:30b (Reviewer 2)",
         "api_type": "ollama",
         "timeout": 7200
       },
       "tester": {
         "url": "http://192.168.40.100:11434/v1",
-        "model": "mixtral:8x7b",
-        "model_name": "Ollama mixtral:8x7b (Tester - 8 Expert Perspectives)",
+        "model": "qwen3-coder:30b",
+        "model_name": "Ollama qwen3-coder:30b (Tester)",
         "api_type": "ollama",
         "timeout": 7200
       },
@@ -66,64 +66,64 @@
       },
       "documenter": {
         "url": "http://192.168.40.100:11434/v1",
-        "model": "qwen2.5:7b",
-        "model_name": "Ollama qwen2.5:7b (Documenter - Fast Docs)",
+        "model": "qwen3-coder:30b",
+        "model_name": "Ollama qwen3-coder:30b (Documenter)",
         "api_type": "ollama",
         "timeout": 7200
       },
       "debugger": {
         "url": "http://192.168.40.100:11434/v1",
-        "model": "deepseek-r1:32b",
-        "model_name": "Ollama deepseek-r1:32b (Debugger - R1 Trace)",
+        "model": "qwen3-coder:30b",
+        "model_name": "Ollama qwen3-coder:30b (Debugger)",
         "api_type": "ollama",
         "timeout": 7200
       },
       "security": {
         "url": "http://192.168.40.100:11434/v1",
-        "model": "deepseek-r1:32b",
-        "model_name": "Ollama deepseek-r1:32b (Security - R1 Vuln Analysis)",
+        "model": "qwen3-coder:30b",
+        "model_name": "Ollama qwen3-coder:30b (Security)",
         "api_type": "ollama",
         "timeout": 7200
       },
       "fallback_coder": {
           "url": "http://192.168.40.100:11434/v1",
-          "model": "qwen2.5-coder:32b",
-          "model_name": "Ollama qwen2.5-coder:32b (Fallback Coder)",
+          "model": "qwen3-coder:30b",
+          "model_name": "Ollama qwen3-coder:30b (Fallback Coder)",
           "api_type": "ollama",
           "timeout": 7200
         },
       "coder_2": {
           "url": "http://192.168.40.100:11434/v1",
-          "model": "wizardcoder:33b",
-          "model_name": "Ollama wizardcoder:33b (Coder 2 - Code Specialist)",
+          "model": "qwen3-coder:30b",
+          "model_name": "Ollama qwen3-coder:30b (Coder 2)",
           "api_type": "ollama",
           "timeout": 7200
         },
       "coder_3": {
           "url": "http://192.168.40.100:11434/v1",
-          "model": "codellama:34b",
-          "model_name": "Ollama codellama:34b (Coder 3 - Reliable)",
+          "model": "qwen3-coder:30b",
+          "model_name": "Ollama qwen3-coder:30b (Coder 3)",
           "api_type": "ollama",
           "timeout": 7200
         },
       "coder_4": {
           "url": "http://192.168.40.100:11434/v1",
-          "model": "deepseek-coder-33b-instruct",
-          "model_name": "Ollama deepseek-coder-33b-instruct (Coder 4 - Alternative)",
+          "model": "qwen3-coder:30b",
+          "model_name": "Ollama qwen3-coder:30b (Coder 4)",
           "api_type": "ollama",
           "timeout": 7200
         },
       "coder_5": {
           "url": "http://192.168.40.100:11434/v1",
-          "model": "deepseek-r1:8b",
-          "model_name": "Ollama deepseek-r1:8b (Coder 5 - Fast R1 Fallback)",
+          "model": "qwen3-coder:30b",
+          "model_name": "Ollama qwen3-coder:30b (Coder 5)",
           "api_type": "ollama",
           "timeout": 7200
         },
       "arbitrator": {
         "url": "http://192.168.40.100:11434/v1",
-        "model": "qwen2.5:7b",
-        "model_name": "Ollama qwen2.5:7b (Arbitrator - Fast Decisions)",
+        "model": "qwen3-coder:30b",
+        "model_name": "Ollama qwen3-coder:30b (Arbitrator)",
         "api_type": "ollama",
         "timeout": 7200
       },
