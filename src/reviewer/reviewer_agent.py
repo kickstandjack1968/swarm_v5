@@ -114,6 +114,35 @@ ISSUES REQUIRING REVISION:
 
 OVERALL: STATUS: APPROVED | STATUS: NEEDS_REVISION"""
 
+    FILE_COMPLIANCE_PROMPT = """You are a code reviewer performing a SINGLE-FILE COMPLIANCE REVIEW.
+You will receive ONE file's code, its plan specification, and the code of its dependencies.
+
+YOUR JOB: Verify this ONE file correctly implements its plan specification.
+
+CHECK:
+1. Does the file export what the plan specifies (correct class/function names)?
+2. Does it implement ALL requirements from the plan spec?
+3. Do method signatures match the plan (correct args, return types)?
+4. Are imports correct (references to dependencies that exist)?
+5. Is there real implementation (no stubs, no placeholders, no pass-only methods)?
+6. Will this code actually work at runtime (correct attribute access, type usage)?
+7. Does it use its dependencies correctly (right method names, right arg types)?
+
+OUTPUT FORMAT (you MUST follow this exactly):
+
+FILE: {filename}
+
+REQUIREMENTS CHECK:
+- Requirement 1: [MET/NOT MET] — [brief reason]
+- Requirement 2: [MET/NOT MET] — [brief reason]
+
+ISSUES:
+1. [Specific bug or missing implementation — be precise with line references]
+(or "None" if no issues)
+
+STATUS: PASS
+(or STATUS: FAIL if any requirement is NOT MET or any issue is critical)"""
+
     def process(self, input_data: dict) -> dict:
         """Process review request."""
 
@@ -121,6 +150,8 @@ OVERALL: STATUS: APPROVED | STATUS: NEEDS_REVISION"""
 
         if mode == "compliance":
             return self._process_compliance(input_data)
+        elif mode == "compliance_file":
+            return self._process_compliance_file(input_data)
         else:
             return self._process_default(input_data)
 
@@ -148,6 +179,50 @@ Perform a compliance review. Check every file against the plan."""
         ]
 
         response = self.call_llm(messages, temperature=0.3, max_tokens=4000)
+        cleaned = self.clean_response(response)
+
+        return {
+            "status": "success",
+            "result": cleaned
+        }
+
+    def _process_compliance_file(self, input_data: dict) -> dict:
+        """Single-file compliance review — verify one file against its plan spec."""
+        file_name = input_data.get("file_name", "unknown.py")
+        file_code = input_data.get("file_code", "")
+        plan_spec = input_data.get("plan_spec", "")
+        dep_code = input_data.get("dependency_code", "")
+        job_spec = input_data.get("job_spec", "")
+
+        if not file_code:
+            return {"status": "error", "error": f"No code provided for {file_name}"}
+
+        user_parts = [f"FILE TO REVIEW: {file_name}\n"]
+
+        if plan_spec:
+            user_parts.append(f"PLAN SPECIFICATION:\n{plan_spec}\n")
+
+        user_parts.append(f"CODE:\n```python\n{file_code}\n```\n")
+
+        if dep_code:
+            user_parts.append(f"DEPENDENCY CODE (for reference):\n{dep_code}\n")
+
+        if job_spec:
+            user_parts.append(f"PROJECT CONTEXT:\n{job_spec[:2000]}\n")
+
+        user_parts.append(f"Review {file_name} against its plan specification. End with STATUS: PASS or STATUS: FAIL.")
+
+        user_message = "\n".join(user_parts)
+
+        system_prompt = self.FILE_COMPLIANCE_PROMPT.replace("{filename}", file_name)
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+
+        max_tokens = input_data.get("config", {}).get("max_tokens", 4000)
+        response = self.call_llm(messages, temperature=0.3, max_tokens=max_tokens)
         cleaned = self.clean_response(response)
 
         return {

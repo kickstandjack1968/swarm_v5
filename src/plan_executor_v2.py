@@ -163,6 +163,39 @@ class PlanExecutor:
         self.logger = setup_logging(log_dir)
         self.job_scope = ""
         self.start_time: Optional[float] = None
+        self.prompt_log_dir: Optional[str] = None  # Set by coordinator to enable prompt logging
+
+    def _log_prompt(self, step: str, agent_name: str, system_prompt: str, user_message: str,
+                    response: str = "", mode: str = "", extra: Optional[Dict] = None):
+        """Save full prompt payload to prompt_logs/ as JSON. No truncation."""
+        if not self.prompt_log_dir:
+            return
+
+        os.makedirs(self.prompt_log_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%H%M%S")
+        safe_step = step.replace("/", "_").replace("\\", "_")
+        filename = f"{timestamp}_PE_{agent_name}_{safe_step}.json"
+
+        log_entry = {
+            "step": step,
+            "agent": agent_name,
+            "timestamp": datetime.now().isoformat(),
+            "mode": mode,
+            "system_prompt": system_prompt,
+            "user_message": user_message,
+            "response": response,
+        }
+        if extra:
+            log_entry.update(extra)
+
+        log_path = os.path.join(self.prompt_log_dir, filename)
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                json.dump(log_entry, f, indent=2)
+            print(f"  [PE_LOG] {filename}")
+        except Exception as e:
+            print(f"  [PE_LOG] Warning: could not save prompt log: {e}")
     
     # =========================================================================
     # PLAN PARSING
@@ -197,23 +230,35 @@ class PlanExecutor:
                         methods=exp.get('methods', {})
                     ))
             
+            # Collect requirements from file level AND from inside exports
+            file_requirements = file_data.get('requirements', [])
+            if not isinstance(file_requirements, list):
+                file_requirements = [file_requirements] if file_requirements else []
+            for exp in file_data.get('exports', []):
+                if isinstance(exp, dict):
+                    exp_reqs = exp.get('requirements', [])
+                    if isinstance(exp_reqs, list):
+                        for r in exp_reqs:
+                            if r and r not in file_requirements:
+                                file_requirements.append(r)
+
             # Parse dependencies
             deps = file_data.get('dependencies', [])
             if deps and isinstance(deps[0], dict):
                 deps = [d['name'] if isinstance(d, dict) else d for d in deps]
-            
+
             # Parse imports_from
             imports_from = file_data.get('imports_from', {})
             if not isinstance(imports_from, dict):
                 imports_from = {}
-            
+
             files.append(FileSpec(
                 name=file_data['name'],
                 purpose=file_data.get('purpose', ''),
                 dependencies=deps,
                 exports=exports,
                 imports_from=imports_from,
-                requirements=file_data.get('requirements', []),
+                requirements=file_requirements,
                 optional=file_data.get('optional', False)
             ))
         
@@ -272,11 +317,17 @@ class PlanExecutor:
         """
         Generate exact import statements from the PLAN.
 
-        Uses common-prefix relative depth algorithm to compute correct
-        relative imports regardless of directory depth.
+        Entry points use absolute imports (they run as scripts via `python main.py`).
+        Other files use relative imports within the package tree.
         """
         if not file_spec.imports_from:
             return ""
+
+        # Entry points must use absolute imports — relative imports fail
+        # when a script is run directly (python main.py)
+        is_entry_point = (
+            self.plan and file_spec.name == self.plan.entry_point
+        )
 
         lines = []
         # Split importer path into directory parts
@@ -289,23 +340,29 @@ class PlanExecutor:
             source_parts = source_file.rsplit('/', 1)[0].split('/') if '/' in source_file else []
             source_base = source_file.rsplit('/', 1)[-1].replace('.py', '')
 
-            # Find common prefix length
-            common = 0
-            while common < min(len(importer_parts), len(source_parts)):
-                if importer_parts[common] == source_parts[common]:
-                    common += 1
-                else:
-                    break
+            if is_entry_point:
+                # Absolute import: from core.calculator import calculate
+                module_path = ".".join(source_parts + [source_base])
+                import_stmt = f"from {module_path} import {', '.join(import_names)}"
+            else:
+                # Relative import for non-entry-point files
+                # Find common prefix length
+                common = 0
+                while common < min(len(importer_parts), len(source_parts)):
+                    if importer_parts[common] == source_parts[common]:
+                        common += 1
+                    else:
+                        break
 
-            # Levels up from importer to common ancestor
-            up = len(importer_parts) - common
-            # Remaining path segments after common ancestor
-            remaining = source_parts[common:]
+                # Levels up from importer to common ancestor
+                up = len(importer_parts) - common
+                # Remaining path segments after common ancestor
+                remaining = source_parts[common:]
 
-            dots = "." * (up + 1)  # "." = current pkg, ".." = parent, etc.
-            module_path = ".".join(remaining + [source_base])
+                dots = "." * (up + 1)  # "." = current pkg, ".." = parent, etc.
+                module_path = ".".join(remaining + [source_base])
+                import_stmt = f"from {dots}{module_path} import {', '.join(import_names)}"
 
-            import_stmt = f"from {dots}{module_path} import {', '.join(import_names)}"
             lines.append(import_stmt)
 
         return '\n'.join(lines)
@@ -349,14 +406,18 @@ class PlanExecutor:
                                 args = method_info.get('args', [])
                                 parts.append(f"      .{method_name}({', '.join(args)})")
         
-        # Add completed file signatures for reference
-        parts.append("")
-        parts.append("ACTUAL SIGNATURES FROM COMPLETED FILES:")
+        # Always show actual signatures from completed dependency files.
+        # These are the REAL signatures the coder must match when calling them.
+        has_actual_sigs = False
         for dep_name in file_spec.dependencies:
             if dep_name in self.completed_files:
                 result = self.completed_files[dep_name]
                 signatures = self._extract_signatures(result.content)
                 if signatures:
+                    if not has_actual_sigs:
+                        parts.append("")
+                        parts.append("ACTUAL SIGNATURES FROM COMPLETED FILES (use these EXACTLY):")
+                        has_actual_sigs = True
                     parts.append(f"\n--- {dep_name} ---")
                     parts.append(signatures[:2000])
         
@@ -383,18 +444,36 @@ class PlanExecutor:
         
         for exp in file_spec.exports:
             if exp.type == "class":
-                parts.append(f"class {exp.name}:  # REQUIRED")
+                parts.append(f"class {exp.name}:")
                 if exp.methods:
                     for method_name, method_info in exp.methods.items():
                         args = method_info.get('args', ['self'])
                         returns = method_info.get('returns', '')
                         ret_hint = f" -> {returns}" if returns else ""
-                        parts.append(f"    def {method_name}({', '.join(args)}){ret_hint}:  # REQUIRED")
+                        parts.append(f"    def {method_name}({', '.join(args)}){ret_hint}:")
+                        parts.append(f"        # IMPLEMENT THIS METHOD COMPLETELY - NO STUBS ALLOWED")
                 parts.append("")
             elif exp.type == "function":
-                parts.append(f"def {exp.name}(...):  # REQUIRED")
+                # Use method signature from plan if available
+                if exp.methods and exp.name in exp.methods:
+                    method_info = exp.methods[exp.name]
+                    args = method_info.get('args', [])
+                    returns = method_info.get('returns', '')
+                    ret_hint = f" -> {returns}" if returns else ""
+                    parts.append(f"def {exp.name}({', '.join(args)}){ret_hint}:")
+                elif exp.methods:
+                    # methods block exists but keyed differently — use first entry
+                    method_name, method_info = next(iter(exp.methods.items()))
+                    args = method_info.get('args', [])
+                    returns = method_info.get('returns', '')
+                    ret_hint = f" -> {returns}" if returns else ""
+                    parts.append(f"def {exp.name}({', '.join(args)}){ret_hint}:")
+                else:
+                    parts.append(f"def {exp.name}():")
+                parts.append(f"    # IMPLEMENT COMPLETELY - return actual result, not None or stub")
             elif exp.type == "constant":
-                parts.append(f"{exp.name} = ...  # REQUIRED")
+                parts.append(f"# Define actual value for {exp.name}, not a placeholder")
+                parts.append(f"{exp.name} = None  # REPLACE with real value")
         
         parts.append("")
         parts.append("WARNING: If ANY of the above are missing or renamed,")
@@ -649,6 +728,17 @@ class PlanExecutor:
             if not isinstance(node, ast.ClassDef):
                 continue
 
+            # Skip exception classes - they are allowed to have minimal implementation
+            is_exception_class = any(
+                (isinstance(base, ast.Name) and base.id in ('Exception', 'Error', 'BaseException')) or
+                (isinstance(base, ast.Attribute) and base.attr in ('Exception', 'Error', 'BaseException'))
+                for base in node.bases
+            )
+            
+            if is_exception_class:
+                # Exception classes are allowed minimal implementation
+                continue
+
             if _is_stub_body(node.body):
                 issues.append(f"Empty class stub: class {node.name} has no real implementation")
 
@@ -683,6 +773,8 @@ class PlanExecutor:
         # Maps class_name -> {'init_args': int (excluding self), 'init_arg_names': [...],
         #                      'class_attributes': set, 'methods': set}
         dep_classes = {}
+        # Maps function_name -> {'required_args': int, 'all_arg_names': [...]}
+        dep_functions = {}
         dep_file_modules = set()  # base module names from all plan files
 
         all_files = context.get('all_files', {})
@@ -776,6 +868,34 @@ class PlanExecutor:
                     'methods': methods,
                 }
 
+            # Also extract top-level function signatures from dependencies
+            for node in ast.iter_child_nodes(dep_tree):
+                if isinstance(node, ast.FunctionDef) and not node.name.startswith('_'):
+                    all_args = [a.arg for a in node.args.args]
+                    defaults_count = len(node.args.defaults)
+                    required = len(all_args) - defaults_count
+                    dep_functions[node.name] = {
+                        'required_args': required,
+                        'all_arg_names': all_args,
+                    }
+
+        # Standard methods that are commonly used but might not be in the plan
+        # These should NOT trigger integration warnings
+        STANDARD_METHODS = {
+            # SQLAlchemy/ORM common methods
+            'commit', 'rollback', 'close', 'flush', 'expunge', 'expunge_all',
+            'refresh', 'merge', 'save', 'save_all', 'delete', 'remove',
+            'query', 'filter', 'filter_by', 'all', 'first', 'one', 'one_or_none',
+            'execute', 'session',
+            # File/IO common methods  
+            'read', 'write', 'open', 'seek', 'tell', 'close',
+            '__enter__', '__exit__', '__aenter__', '__aexit__',
+            # Context manager methods
+            '__iter__', '__next__', '__len__', '__contains__',
+            # Common utility methods
+            'get', 'set', 'update', 'create', 'add', 'append',
+        }
+
         # --- Section 2: Constructor arg validation ---
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -784,14 +904,36 @@ class PlanExecutor:
                 cls_name = node.func.id
                 cls_info = dep_classes[cls_name]
                 required = cls_info['init_args']
+                max_args = len(cls_info['init_arg_names'])
                 provided = len(node.args) + len(node.keywords)
+                
+                # Only warn if providing FEWER args than the minimum required
+                # (Don't warn if providing more - might be using kwargs or the plan was incomplete)
                 if provided < required:
                     issues.append(
                         f"Constructor {cls_name}() provides {provided} args but requires {required}"
                     )
-                elif provided > len(cls_info['init_arg_names']):
+
+        # --- Section 2b: Function call arg validation ---
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id in dep_functions:
+                func_name = node.func.id
+                func_info = dep_functions[func_name]
+                required = func_info['required_args']
+                max_args = len(func_info['all_arg_names'])
+                provided = len(node.args) + len(node.keywords)
+
+                if provided > max_args:
                     issues.append(
-                        f"Constructor {cls_name}() provides {provided} args but __init__ only accepts {len(cls_info['init_arg_names'])}"
+                        f"Function {func_name}() called with {provided} args but accepts at most {max_args}: "
+                        f"{', '.join(func_info['all_arg_names'])}"
+                    )
+                elif provided < required:
+                    issues.append(
+                        f"Function {func_name}() called with {provided} args but requires at least {required}: "
+                        f"{', '.join(func_info['all_arg_names'][:required])}"
                     )
 
         # --- Section 3: Phantom import detection ---
@@ -853,34 +995,44 @@ class PlanExecutor:
                         node.value.value.id == 'self'):
                     x_attr = node.value.attr
                     y_attr = node.attr
+                    # Skip standard methods that are commonly added but not in plan
+                    if y_attr in STANDARD_METHODS:
+                        continue
                     key = (cls_node.name, x_attr)
                     if key in self_type_map:
                         type_name = self_type_map[key]
                         if type_name in dep_classes:
                             known_attrs = dep_classes[type_name]['class_attributes']
-                            if y_attr not in known_attrs:
+                            # Also check against methods, not just class_attributes
+                            known_methods = dep_classes[type_name].get('methods', set())
+                            if y_attr not in known_attrs and y_attr not in known_methods:
                                 issue_key = (x_attr, y_attr, type_name)
                                 if issue_key not in seen_attr_issues:
                                     seen_attr_issues.add(issue_key)
                                     issues.append(
                                         f"self.{x_attr}.{y_attr} — '{y_attr}' not found in "
-                                        f"{type_name} (available: {', '.join(sorted(known_attrs)[:15])})"
+                                        f"{type_name} (available: {', '.join(sorted(known_attrs | known_methods)[:15])})"
                                     )
 
         # --- Section 6: Validate constructor keyword args ---
+        # Only warn about kwargs that are clearly wrong, not ones that might be valid
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             if isinstance(node.func, ast.Name) and node.func.id in dep_classes:
                 cls_name = node.func.id
                 cls_info = dep_classes[cls_name]
+                known_params = set(cls_info['init_arg_names'])
                 for kw in node.keywords:
-                    if kw.arg and kw.arg not in cls_info['init_arg_names']:
-                        issues.append(
-                            f"Constructor {cls_name}(... {kw.arg}=...) — "
-                            f"'{kw.arg}' is not a parameter of __init__ "
-                            f"(params: {', '.join(cls_info['init_arg_names'])})"
-                        )
+                    if kw.arg and kw.arg not in known_params:
+                        # Only warn if it's a clearly invalid param, not just unknown
+                        # (might be using **kwargs or plan was incomplete)
+                        if kw.arg not in STANDARD_METHODS and not kw.arg.startswith('_'):
+                            issues.append(
+                                f"Constructor {cls_name}(... {kw.arg}=...) — "
+                                f"'{kw.arg}' is not a known parameter "
+                                f"(known: {', '.join(sorted(known_params)[:10])})"
+                            )
 
         return issues
     
@@ -1067,25 +1219,37 @@ Remember: Your code will be REJECTED if mandatory exports are missing.
                 continue
             
             parts.append(f"From {dep_name}:")
+            content = dep_info.get('content', '')
             for exp in exports:
                 exp_name = exp.get('name', exp) if isinstance(exp, dict) else exp
                 exp_type = exp.get('type', 'unknown') if isinstance(exp, dict) else 'unknown'
                 parts.append(f"  [ ] Did you import {exp_name}?")
-                
-                if exp_type == 'class':
-                    # Try to find __init__ signature
-                    content = dep_info.get('content', '')
-                    if content:
-                        try:
-                            from agent_base import extract_class_info
-                            classes = extract_class_info(content)
-                            if exp_name in classes:
-                                init_info = classes[exp_name].get('methods', {}).get('__init__', {})
-                                args = init_info.get('args', ['self'])
-                                if len(args) > 1:
-                                    parts.append(f"      [ ] {exp_name}() requires: {', '.join(args[1:])}")
-                        except:
-                            pass
+
+                if content:
+                    # Extract actual signature from completed code using AST
+                    try:
+                        tree = ast.parse(content)
+                        for node in ast.iter_child_nodes(tree):
+                            if isinstance(node, ast.ClassDef) and node.name == exp_name:
+                                for item in node.body:
+                                    if isinstance(item, ast.FunctionDef) and item.name == '__init__':
+                                        try:
+                                            args_str = ast.unparse(item.args)
+                                            # Remove 'self' for display
+                                            args_list = [a.arg for a in item.args.args if a.arg != 'self']
+                                            if args_list:
+                                                parts.append(f"      [ ] {exp_name}() requires: {', '.join(args_list)}")
+                                        except:
+                                            pass
+                            elif isinstance(node, ast.FunctionDef) and node.name == exp_name:
+                                try:
+                                    args_list = [a.arg for a in node.args.args]
+                                    sig = f"{exp_name}({', '.join(args_list)})"
+                                    parts.append(f"      [ ] Call as: {sig}")
+                                except:
+                                    pass
+                    except SyntaxError:
+                        pass
             parts.append("")
         
         return '\n'.join(parts)
@@ -1227,18 +1391,52 @@ Remember: Your code will be REJECTED if mandatory exports are missing.
 You MUST fix this issue. The plan requires specific exports.
 
 {user_message}"""
+                    self._log_prompt(
+                        step=f"GENERATE_{file_spec.name}_retry{attempt}",
+                        agent_name="CODER",
+                        system_prompt=system_prompt,
+                        user_message=retry_message,
+                        mode="generate_file_retry",
+                        extra={"file": file_spec.name, "attempt": attempt, "last_error": last_error}
+                    )
                     response = self.executor.execute_agent(
                         role=AgentRole.CODER,
                         system_prompt=system_prompt,
                         user_message=retry_message
                     )
+                    self._log_prompt(
+                        step=f"GENERATE_{file_spec.name}_retry{attempt}_RESPONSE",
+                        agent_name="CODER",
+                        system_prompt="",
+                        user_message="",
+                        response=response,
+                        mode="generate_file_retry_response",
+                        extra={"file": file_spec.name, "attempt": attempt}
+                    )
                 else:
+                    self._log_prompt(
+                        step=f"GENERATE_{file_spec.name}",
+                        agent_name="CODER",
+                        system_prompt=system_prompt,
+                        user_message=user_message,
+                        mode="generate_file",
+                        extra={"file": file_spec.name, "attempt": attempt}
+                    )
                     response = self.executor.execute_agent(
                         role=AgentRole.CODER,
                         system_prompt=system_prompt,
                         user_message=user_message
                     )
-                
+                    self._log_prompt(
+                        step=f"GENERATE_{file_spec.name}_RESPONSE",
+                        agent_name="CODER",
+                        system_prompt="",
+                        user_message="",
+                        response=response,
+                        mode="generate_file_response",
+                        extra={"file": file_spec.name, "attempt": attempt}
+                    )
+
                 # Clean response
                 content = self._clean_code_output(response, file_spec.name)
                 
@@ -1388,7 +1586,11 @@ WHAT'S WRONG (fix these):
             user_message += f"\n\n{'='*60}\nPLAN REQUIREMENTS:\n{'='*60}\n"
             user_message += f"Purpose: {file_spec.purpose}\n"
             if file_spec.requirements:
-                user_message += "Must implement:\n" + '\n'.join(f"  - {r}" for r in file_spec.requirements[:5])  # Top 5 only
+                user_message += "Must implement:\n" + '\n'.join(f"  - {r}" for r in file_spec.requirements[:10])
+            # Always include mandatory export signatures so the coder knows
+            # the correct function/class signatures to use
+            if mandatory_exports:
+                user_message += f"\n\n{mandatory_exports}"
 
             # Code handling - smart truncation
             code_lines = result.content.split('\n')
@@ -1412,10 +1614,28 @@ WHAT'S WRONG (fix these):
             user_message += "Output the COMPLETE fixed code (all functions, all logic):"
 
             try:
+                self._log_prompt(
+                    step=f"REVISION_{file_spec.name}_attempt{attempt+1}",
+                    agent_name=f"CODER_{str(role)}",
+                    system_prompt=system_prompt,
+                    user_message=user_message,
+                    mode="file_revision",
+                    extra={"file": file_spec.name, "attempt": attempt + 1, "model": model_name,
+                           "issues": issues}
+                )
                 response = self.executor.execute_agent(
                     role=role,
                     system_prompt=system_prompt,
                     user_message=user_message
+                )
+                self._log_prompt(
+                    step=f"REVISION_{file_spec.name}_attempt{attempt+1}_RESPONSE",
+                    agent_name=f"CODER_{str(role)}",
+                    system_prompt="",
+                    user_message="",
+                    response=response,
+                    mode="file_revision_response",
+                    extra={"file": file_spec.name, "attempt": attempt + 1, "model": model_name}
                 )
 
                 content = self._clean_code_output(response, file_spec.name)

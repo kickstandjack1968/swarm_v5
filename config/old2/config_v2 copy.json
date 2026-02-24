@@ -24,8 +24,8 @@
       },
       "coder": {
         "url": "http://localhost:1234/v1",
-        "model": "deepseek-r1-distill-qwen-32b",
-        "model_name": "LM Studio deepseek-r1-distill-qwen-32b (Coder)",
+        "model": "qwen/qwen3-coder-30b",
+        "model_name": "LM Studio qwen/qwen3-coder-30b (Coder)",
         "api_type": "openai",
         "timeout": 7200
       },
@@ -39,14 +39,14 @@
       "reviewer": {
         "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
-        "model_name": "qwen/qwen3-coder-30b (Reviewer)",
+        "model_name": "LM Studio qwen/qwen3-coder-30b (Reviewer)",
         "api_type": "openai",
         "timeout": 7200
       },
       "tester": {
         "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
-        "model_name": "qwen/qwen3-coder-30b (Tester)",
+        "model_name": "LM Studio qwen/qwen3-coder-30b (Tester)",
         "api_type": "openai",
         "timeout": 7200
       },
@@ -60,35 +60,35 @@
       "documenter": {
         "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
-        "model_name": "qwen/qwen3-coder-30b (Documenter)",
+        "model_name": "LM Studio qwen/qwen3-coder-30b (Documenter)",
         "api_type": "openai",
         "timeout": 7200
       },
       "debugger": {
         "url": "http://localhost:1234/v1",
         "model": "qwen/qwen3-coder-30b",
-        "model_name": "qwen2.5-coder-32b-instruct(Debugger)",
+        "model_name": "LM Studio qwen/qwen3-coder-30b (Debugger)",
         "api_type": "openai",
         "timeout": 7200
       },
       "security": {
         "url": "http://localhost:1234/v1",
-        "model": "qwen2.5-coder-32b-instruct",
-        "model_name": "qwen2.5-coder-32b-instruct(Security)",
+        "model": "qwen/qwen3-coder-30b",
+        "model_name": "LM Studio qwen/qwen3-coder-30b (Security)",
         "api_type": "openai",
         "timeout": 7200
       },
       "fallback_coder": {
           "url": "http://localhost:1234/v1",
-          "model": "qwen2.5-coder-32b-instruct",
-          "model_name": "qwen2.5-coder-32b-instruct(Security)",
+          "model": "qwen/qwen3-coder-30b",
+          "model_name": "LM Studio qwen/qwen3-coder-30b (Fallback Coder)",
           "api_type": "openai",
           "timeout": 7200
         },
       "arbitrator": {
         "url": "http://localhost:1234/v1",
-        "model": "qwen/qwen3-coder-30b",
-        "model_name": "qwen/qwen3-coder-30b (Arbitrator)",
+        "model": "qwen2.5-coder-7b-instruct",
+        "model_name": "qwen2.5-coder-7b-instruct (Arbitrator)",
         "api_type": "openai",
         "timeout": 7200
       }

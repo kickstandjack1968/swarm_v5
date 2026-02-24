@@ -220,6 +220,15 @@ CRITICAL RULES:
 6. Use forward slashes for subdirectory files: "core/processor.py" not "core.processor"
 7. Quote filenames containing slashes in YAML: "core/processor.py"
 
+COMPLETENESS RULES (prevents missing features):
+7a. The entry_point file MUST exist in the files list. If entry_point is "main.py", there MUST be a file named "main.py".
+7b. EVERY feature in the job spec MUST map to a requirement in at least one file. Before outputting, mentally check each
+    requirement from the spec and verify it appears somewhere in your plan. If the spec mentions periodic tasks, background
+    jobs, pruning, cleanup, caching, or scheduled operations — they MUST appear as requirements on a file.
+7c. Non-Python files (HTML, CSS, JS, config files) are allowed in the plan. Mark them with no exports and no needs_from.
+    The entry point or API file MUST have a requirement to serve/load these files.
+7d. requirements.txt should only list installable packages (not stdlib modules like sqlite3, json, os, etc.)
+
 REQUIREMENTS MUST BE IMPLEMENTATION-SPECIFIC:
 8. Each requirement MUST specify HOW to implement, not just WHAT.
    BAD:  "Implement document classification"
@@ -328,7 +337,15 @@ RULES:
         validation_error = input_data.get("validation_error", "")
         fix_section = ""
         if validation_error:
-            fix_section = f"\n\nPREVIOUS PLAN REJECTED — FIX THESE ERRORS:\n{validation_error}\n\nCommon fixes:\n- Use path-based filenames (core/module.py not core.module)\n- needs_from must ONLY reference internal project files, not external packages\n- Every type in method signatures MUST appear in needs_from for that file\n"
+            fix_section = (
+                f"\n\nPREVIOUS PLAN REJECTED — FIX THESE ERRORS:\n{validation_error}\n\n"
+                "Common fixes:\n"
+                "- Python builtins (str, int, Exception, Path, etc.) do NOT need needs_from entries — just use them\n"
+                "- If a type IS defined in your plan (e.g. a class you export), the file using it MUST list it in needs_from\n"
+                "- If a parameter has a default value, use the format 'param: type = default' with spaces around '='\n"
+                "- Use path-based filenames (core/module.py not core.module)\n"
+                "- needs_from must ONLY reference internal project files, not external packages\n"
+            )
 
         user_prompt = f"Create a YAML execution plan for this project:\n\n{job_spec}{fix_section}\n\nOutput the YAML plan:"
 
@@ -353,7 +370,15 @@ RULES:
         job_spec_section = f"\nORIGINAL REQUIREMENTS (verify your final plan covers ALL of these):\n{job_spec}\n" if job_spec else ""
         fix_section = ""
         if validation_error:
-            fix_section = f"\nPREVIOUS PLAN REJECTED — FIX THESE ERRORS:\n{validation_error}\n\nCommon fixes:\n- Every type in a method signature MUST appear in needs_from so coders get its code\n- File names in needs_from must be exact path-based names (core/module.py not core.module)\n- needs_from must ONLY reference internal project files\n"
+            fix_section = (
+                f"\nPREVIOUS PLAN REJECTED — FIX THESE ERRORS:\n{validation_error}\n\n"
+                "Common fixes:\n"
+                "- Python builtins (str, int, Exception, Path, etc.) do NOT need needs_from entries — just use them\n"
+                "- If a type IS defined in your plan (e.g. a class you export), the file using it MUST list it in needs_from\n"
+                "- If a parameter has a default value, use the format 'param: type = default' with spaces around '='\n"
+                "- File names in needs_from must be exact path-based names (core/module.py not core.module)\n"
+                "- needs_from must ONLY reference internal project files, not external packages\n"
+            )
 
         user_prompt = f"""{job_spec_section}{fix_section}
 DRAFT PLAN:
@@ -513,9 +538,23 @@ Output the COMPLETE revised YAML plan:"""
             if m:
                 key, value = m.group(1), m.group(2)
 
-                # If value is empty, already quoted, or a YAML token, skip
-                if not value or value.startswith(("'", '"', "&", "*")):
+                # If value is empty or a YAML token, skip
+                if not value or value.startswith(("&", "*")):
                     repaired_lines.append(line)
+                    continue
+
+                # Check quoted values — only safe if quote is closed with no trailing content
+                if value.startswith(("'", '"')):
+                    q = value[0]
+                    close_idx = value.find(q, 1)
+                    while close_idx != -1 and close_idx > 0 and value[close_idx - 1] == '\\':
+                        close_idx = value.find(q, close_idx + 1)
+                    if close_idx != -1 and close_idx == len(value) - 1:
+                        repaired_lines.append(line)
+                        continue
+                    # Trailing content after close quote — re-quote the whole value
+                    safe_value = value.replace("'", "''")
+                    repaired_lines.append(f"{indent}{list_prefix}{key}: '{safe_value}'")
                     continue
 
                 # Inline flow sequence: [item1, item2, ...] — quote unquoted items with colons
@@ -550,13 +589,23 @@ Output the COMPLETE revised YAML plan:"""
 
             elif list_prefix and working:
                 # Bare list item (no key: value structure)
-                # Already quoted? skip
+                # Check if it looks quoted but has trailing content after the
+                # closing quote, e.g.: "some value" extra stuff
+                # YAML will parse the quoted part as a scalar and choke on the rest.
                 if working.startswith(("'", '"')):
-                    repaired_lines.append(line)
-                    continue
+                    q = working[0]
+                    # Find the matching close quote (skip escaped quotes)
+                    close_idx = working.find(q, 1)
+                    while close_idx != -1 and working[close_idx - 1] == '\\':
+                        close_idx = working.find(q, close_idx + 1)
+                    # If properly quoted with nothing after → safe
+                    if close_idx != -1 and close_idx == len(working) - 1:
+                        repaired_lines.append(line)
+                        continue
+                    # Otherwise fall through to re-quote the whole value
 
-                # Contains ": " or "->" — quote the whole value
-                if ": " in working or "->" in working:
+                # Contains ": " or "->" or problematic quoting — quote the whole value
+                if ": " in working or "->" in working or working.startswith(("'", '"')):
                     safe_value = working.replace("'", "''")
                     repaired_lines.append(f"{indent}- '{safe_value}'")
                 else:
@@ -640,8 +689,10 @@ Output the COMPLETE revised YAML plan:"""
                 source_exports = file_exports.get(source, set())
                 for imp in imports:
                     if imp not in source_exports:
-                        # Warning only - might be auto-generated
-                        pass
+                        raise ValueError(
+                            f"File '{name}' imports '{imp}' from '{source}', "
+                            f"but '{source}' only exports: {sorted(source_exports) if source_exports else '(nothing)'}"
+                        )
                 
                 # Ensure source is in dependencies
                 if source not in f['dependencies']:
@@ -658,22 +709,33 @@ Output the COMPLETE revised YAML plan:"""
             # Python builtins
             'str', 'int', 'float', 'bool', 'dict', 'list', 'tuple', 'set', 'bytes',
             'bytearray', 'memoryview', 'complex', 'frozenset', 'None', 'object',
+            # Builtin exceptions
+            'Exception', 'BaseException', 'ValueError', 'TypeError', 'KeyError',
+            'IndexError', 'AttributeError', 'RuntimeError', 'OSError', 'IOError',
+            'FileNotFoundError', 'ConnectionError', 'TimeoutError', 'StopIteration',
+            'NotImplementedError', 'PermissionError', 'ImportError', 'ArithmeticError',
+            'LookupError', 'StopAsyncIteration', 'SystemExit', 'KeyboardInterrupt',
             # typing module
             'Any', 'Optional', 'Union', 'List', 'Dict', 'Tuple', 'Set', 'FrozenSet',
             'Callable', 'Iterator', 'Generator', 'Type', 'ClassVar', 'Final',
             'Sequence', 'Mapping', 'MutableMapping', 'Iterable', 'IO',
+            'Coroutine', 'Awaitable', 'AsyncIterator', 'AsyncGenerator',
+            'NamedTuple', 'TypedDict', 'Protocol', 'Literal',
             # stdlib types commonly used in signatures
             'Path', 'PurePath', 'PosixPath', 'WindowsPath',  # pathlib
             'datetime', 'date', 'time', 'timedelta', 'timezone',  # datetime
-            'Enum', 'IntEnum',  # enum
+            'Enum', 'IntEnum', 'StrEnum',  # enum
             'dataclass',  # dataclasses
             'Pattern', 'Match',  # re
             'Logger',  # logging
             'TextIO', 'BinaryIO',  # io
             'Queue',  # queue
-            'Thread', 'Lock',  # threading
+            'Thread', 'Lock', 'Event',  # threading
             'Decimal',  # decimal
             'UUID',  # uuid
+            'deque', 'defaultdict', 'Counter', 'OrderedDict',  # collections
+            'Connection', 'Cursor',  # sqlite3
+            'Process',  # multiprocessing
             # generic type vars
             'self', 'cls', 'T', 'KT', 'VT', 'S',
         }
@@ -702,20 +764,30 @@ Output the COMPLETE revised YAML plan:"""
                         if not isinstance(arg_str, str) or ':' not in arg_str:
                             continue
                         type_part = arg_str.split(':', 1)[1].strip()
+                        # Strip default values: str = '~/.eve/watchdog' → str
+                        # Only split on '=' that is outside quotes
+                        if '=' in type_part:
+                            eq_idx = type_part.find('=')
+                            before_eq = type_part[:eq_idx]
+                            if before_eq.count("'") % 2 == 0 and before_eq.count('"') % 2 == 0:
+                                type_part = before_eq.strip()
                         # Strip generics: list[T] → list, Optional[T] → Optional
                         base_type = _re.sub(r'\[.*', '', type_part).strip()
                         base_type = base_type.lstrip('*').strip()
-                        # Strip dotted module prefix: pathlib.Path → Path, datetime.datetime → datetime
-                        leaf_type = base_type.rsplit('.', 1)[-1] if '.' in base_type else base_type
-                        if (base_type and leaf_type not in PRIMITIVES
-                                and base_type not in own_exports and leaf_type not in own_exports
-                                and base_type not in importable_types and leaf_type not in importable_types):
-                            raise ValueError(
-                                f"File '{name}' method '{exp.get('name','?')}.{method_name}' "
-                                f"parameter '{arg_str}' uses type '{base_type}', but '{base_type}' "
-                                f"is not listed in needs_from. Add the file that exports '{base_type}' "
-                                f"to needs_from so coders can see its interface."
-                            )
+                        # Handle union types: str|bytes → check each part separately
+                        union_parts = [p.strip() for p in base_type.replace('|', ',').split(',')]
+                        for upart in union_parts:
+                            # Strip dotted module prefix: pathlib.Path → Path
+                            leaf_type = upart.rsplit('.', 1)[-1] if '.' in upart else upart
+                            if (upart and leaf_type not in PRIMITIVES
+                                    and upart not in own_exports and leaf_type not in own_exports
+                                    and upart not in importable_types and leaf_type not in importable_types):
+                                raise ValueError(
+                                    f"File '{name}' method '{exp.get('name','?')}.{method_name}' "
+                                    f"parameter '{arg_str}' uses type '{upart}', but '{upart}' "
+                                    f"is not listed in needs_from. Add the file that exports '{upart}' "
+                                    f"to needs_from so coders can see its interface."
+                                )
 
 
 if __name__ == "__main__":

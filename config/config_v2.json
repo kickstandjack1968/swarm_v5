@@ -38,8 +38,15 @@
       },
       "reviewer": {
         "url": "http://192.168.40.100:11434/v1",
+        "model": "qwen2.5-coder:32b",
+        "model_name": "Ollama qwen2.5-coder:32b (Reviewer - General Python)",
+        "api_type": "ollama",
+        "timeout": 7200
+      },
+      "reviewer_2": {
+        "url": "http://192.168.40.100:11434/v1",
         "model": "deepseek-r1:32b",
-        "model_name": "Ollama deepseek-r1:32b (Reviewer - R1 Reasoning)",
+        "model_name": "Ollama deepseek-r1:32b (Reviewer 2 - Logic/Control Flow)",
         "api_type": "ollama",
         "timeout": 7200
       },
@@ -175,6 +182,11 @@
       "max_tokens": 35000,
       "top_p": 0.95,
       "adversarial_mode": true
+    },
+    "reviewer_2": {
+      "temperature": 0.3,
+      "max_tokens": 12000,
+      "top_p": 0.9
     },
     "tester": {
       "temperature": 0.4,

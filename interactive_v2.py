@@ -93,6 +93,32 @@ def select_workflow() -> str:
             print("❌ Invalid choice. Please enter 1-8.")
 
 
+def select_stop_after() -> str:
+    """Let user select which collaborative stage to stop after."""
+    print("\n⏸ Stop after which stage?")
+    print("   1. CLARIFY        - Stop after clarifier produces job scope")
+    print("   2. DRAFT_PLAN     - Stop after architect drafts the plan")
+    print("   3. PLAN_REVIEW    - Stop after coder reviews the plan")
+    print("   4. FINALIZE_PLAN  - Stop after architect finalizes the plan")
+    print("   5. BUILD          - Stop after coder builds all files")
+    print("   6. COMPLIANCE     - Run everything (full pipeline)")
+
+    stage_map = {
+        '1': 'clarify',
+        '2': 'draft_plan',
+        '3': 'plan_review',
+        '4': 'finalize_plan',
+        '5': 'build',
+        '6': None,  # None = run all
+    }
+
+    while True:
+        choice = input("\nYour choice [1-6]: ").strip()
+        if choice in stage_map:
+            return stage_map[choice]
+        print("❌ Invalid choice. Please enter 1-6.")
+
+
 def configure_custom_workflow(coordinator: SwarmCoordinator) -> str:
     """Allow user to build custom workflow and return the project description"""
     print("\n🔧 Custom Workflow Builder")
@@ -414,16 +440,21 @@ def main():
             user_request = get_multiline_input(
                 f"\n{'='*80}\nWhat would you like to build?\n{'='*80}\n"
             )
-            
+
             if not user_request.strip():
                 print("\n❌ No request provided. Exiting.")
                 return
-            
+
+            # For collaborative workflow, ask which stage to stop after
+            stop_after = None
+            if workflow_type == 'collaborative':
+                stop_after = select_stop_after()
+
             print("\n" + "=" * 80)
             print(f"EXECUTING {workflow_type.upper()} WORKFLOW")
             print("=" * 80)
-            
-            coordinator.run_workflow(user_request, workflow_type=workflow_type)
+
+            coordinator.run_workflow(user_request, workflow_type=workflow_type, stop_after=stop_after)
         
         # Save outputs
         save_outputs(coordinator)

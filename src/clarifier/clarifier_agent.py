@@ -73,21 +73,40 @@ class ClarifierAgent(AgentBase):
     - 'synthesize': Combine Q&A into job scope
     """
     
-    CLARIFY_PROMPT = """You are a Requirements Clarification Agent. Your ONLY job is to ask questions.
+    CLARIFY_PROMPT = """You are the Clarifier agent — the first stage in a multi-agent software development pipeline.
+Your job is to analyze a raw user request and identify every ambiguity that would block implementation.
 
-CRITICAL INSTRUCTIONS:
-1. Ask clarifying questions to fully understand the requirements
-2. Simple requests: 1-2 questions
-3. Complex systems: 5-10 questions
-4. Do NOT provide solutions or code
-5. Do NOT say requirements are clear unless they truly are
+You do NOT design solutions. You do NOT write code. You do NOT make assumptions silently.
+You identify gaps and ask concrete questions.
+
+ANALYZE THE REQUEST FOR GAPS IN:
+- INPUT: What data comes in? Format, source, volume, variability?
+- OUTPUT: What is produced? Format, destination, schema?
+- ERROR CASES: What can go wrong? What should happen when it does?
+- SCALE: How much data, how often, how many users?
+- EDGE CASES: Empty inputs, malformed data, boundary values, concurrent access?
+- CONSTRAINTS: Language version, libraries, environment, performance requirements?
+
+Do NOT ask about things already specified in the request.
+Do NOT ask philosophical or open-ended questions.
+Every question must be about a concrete implementation decision.
 
 RESPONSE FORMAT:
-CLARIFYING QUESTIONS:
-1. [Question about missing requirement]
-2. [Question about unclear specification]
 
-ONLY if ALL requirements are crystal clear:
+QUESTIONS:
+1. [BLOCKING] <specific, implementation-focused question>
+   → Default if skipped: <what you will assume>
+2. [IMPORTANT] <specific, implementation-focused question>
+   → Default if skipped: <what you will assume>
+3. [OPTIONAL] <specific, implementation-focused question>
+   → Default if skipped: <what you will assume>
+
+Priority definitions:
+- BLOCKING: Cannot produce a correct spec without this answer.
+- IMPORTANT: Answer significantly changes the design. Will proceed with stated default if skipped.
+- OPTIONAL: Minor implementation detail. Will always use stated default if skipped.
+
+ONLY if ALL requirements are crystal clear with no gaps:
 STATUS: CLEAR - All requirements are well-defined."""
 
     SYNTHESIZE_PROMPT = """You are a Technical Project Manager.
@@ -101,33 +120,51 @@ OUTPUT RULES:
 
     SYNTHESIZE_STRUCTURED_PROMPT = """You are a Technical Project Manager producing a STRUCTURED JOB SPECIFICATION.
 
-From the original request and Q&A session, produce a document with EXACTLY these sections:
+From the original request and Q&A session, synthesize a complete, unambiguous spec.
 
-## PROJECT OVERVIEW
-One paragraph describing what this software does.
+CRITICAL RULES:
+- PRESERVE all technology choices from the original request (libraries, frameworks, languages, protocols).
+  If the request says "FastAPI", the spec says "FastAPI" — do NOT substitute or generalize.
+- PRESERVE all specific schemas, data formats, and API designs from the original request.
+- Every assumption you make (where the user didn't specify) must be documented explicitly.
+- Acceptance criteria must be testable — each one is objectively pass or fail.
+- out_of_scope must be populated — explicitly bounding scope prevents downstream drift.
 
-## FUNCTIONAL REQUIREMENTS
-Numbered list of specific behaviors the software must exhibit.
+Output ONLY the JSON below, no other text.
 
-## INPUT/OUTPUT SPECIFICATION
-- What inputs does the program accept (files, CLI args, stdin)?
-- What outputs does it produce (files, stdout, return values)?
-- What formats are used?
-
-## ERROR HANDLING
-- What errors should be handled?
-- What should happen when they occur?
-
-## CONSTRAINTS
-- External libraries allowed/needed
-- Environment requirements
-- Performance expectations (if any)
-
-## ACCEPTANCE CRITERIA
-Numbered list of testable criteria that define "done".
-
-Do NOT include implementation details (no class names, no file structure, no import paths).
-Output ONLY the structured job specification."""
+JOB_SPEC_JSON:
+```json
+{
+  "title": "<short snake_case project title>",
+  "description": "<complete description — specific enough that two developers would build the same thing>",
+  "requirements": [
+    "<functional requirement — preserve exact tech/library names from the original request>"
+  ],
+  "constraints": [
+    "<hard constraint: language, libraries, environment, performance>",
+    "<ASSUMPTION: what you assumed and why>"
+  ],
+  "input_format": "<all inputs: type, format, source, expected volume>",
+  "output_format": "<all outputs: type, format, destination, schema>",
+  "error_handling": "<how each error class should be handled>",
+  "edge_cases": [
+    "<edge case and required behavior>"
+  ],
+  "out_of_scope": [
+    "<feature or behavior explicitly excluded>"
+  ],
+  "acceptance_criteria": [
+    "<testable criterion — specific enough to pass or fail>"
+  ],
+  "open_questions": [
+    {
+      "question": "<unresolved ambiguity>",
+      "impact": "<what it affects>",
+      "assumed_resolution": "<what you assumed>"
+    }
+  ]
+}
+```"""
     
     def process(self, input_data: dict) -> dict:
         """Process clarification or synthesis request."""
@@ -206,7 +243,7 @@ CLARIFICATION QUESTIONS:
 USER ANSWERS:
 {answers}
 
-Synthesize these into a complete, unified Job Scope."""
+Synthesize these into a complete, unified Job Specification."""
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -216,16 +253,96 @@ Synthesize these into a complete, unified Job Scope."""
         response = self.call_llm(messages)
         cleaned = self.clean_response(response)
 
+        # Try to extract JSON from structured output
+        job_spec_text = cleaned
+        if output_format == "structured":
+            job_spec_json = self._extract_job_spec_json(cleaned)
+            if job_spec_json:
+                # Store both the raw JSON and a readable version for the architect
+                job_spec_text = self._format_job_spec_for_architect(job_spec_json)
+
         result = {
             "status": "success",
-            "job_scope": cleaned
+            "job_scope": job_spec_text
         }
 
         # Also return as job_spec key for collaborative workflow
         if output_format == "structured":
-            result["job_spec"] = cleaned
+            result["job_spec"] = job_spec_text
 
         return result
+
+    def _extract_job_spec_json(self, text: str) -> dict:
+        """Try to extract JOB_SPEC_JSON from clarifier output."""
+        # Try to find JSON block
+        json_match = re.search(r'```json\s*\n(.*?)\n```', text, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # Try to find raw JSON object
+        json_match = re.search(r'\{[\s\S]*"title"[\s\S]*"requirements"[\s\S]*\}', text)
+        if json_match:
+            try:
+                return json.loads(json_match.group(0))
+            except json.JSONDecodeError:
+                pass
+
+        return None
+
+    def _format_job_spec_for_architect(self, spec: dict) -> str:
+        """Format JOB_SPEC_JSON into readable text the architect can use."""
+        parts = []
+
+        parts.append(f"## {spec.get('title', 'Untitled Project')}")
+        parts.append(f"\n{spec.get('description', '')}")
+
+        if spec.get('requirements'):
+            parts.append("\n## REQUIREMENTS")
+            for i, req in enumerate(spec['requirements'], 1):
+                parts.append(f"{i}. {req}")
+
+        if spec.get('constraints'):
+            parts.append("\n## CONSTRAINTS")
+            for c in spec['constraints']:
+                parts.append(f"- {c}")
+
+        if spec.get('input_format'):
+            parts.append(f"\n## INPUT FORMAT\n{spec['input_format']}")
+
+        if spec.get('output_format'):
+            parts.append(f"\n## OUTPUT FORMAT\n{spec['output_format']}")
+
+        if spec.get('error_handling'):
+            parts.append(f"\n## ERROR HANDLING\n{spec['error_handling']}")
+
+        if spec.get('edge_cases'):
+            parts.append("\n## EDGE CASES")
+            for ec in spec['edge_cases']:
+                parts.append(f"- {ec}")
+
+        if spec.get('out_of_scope'):
+            parts.append("\n## OUT OF SCOPE")
+            for oos in spec['out_of_scope']:
+                parts.append(f"- {oos}")
+
+        if spec.get('acceptance_criteria'):
+            parts.append("\n## ACCEPTANCE CRITERIA")
+            for i, ac in enumerate(spec['acceptance_criteria'], 1):
+                parts.append(f"{i}. {ac}")
+
+        if spec.get('open_questions'):
+            parts.append("\n## OPEN QUESTIONS")
+            for oq in spec['open_questions']:
+                q = oq if isinstance(oq, str) else oq.get('question', '')
+                assumed = oq.get('assumed_resolution', '') if isinstance(oq, dict) else ''
+                parts.append(f"- {q}")
+                if assumed:
+                    parts.append(f"  → Assumed: {assumed}")
+
+        return '\n'.join(parts)
 
 
 if __name__ == "__main__":
