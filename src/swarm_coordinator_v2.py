@@ -4023,7 +4023,7 @@ Be specific and reference actual code from the project."""
                 self.state["context"]["job_spec"] = job_scope
 
         if self.state["context"].get("clarification_assumed_defaults"):
-            job_scope += "\n\nASSUMPTIONS:\n- No clarifier answers were provided; agent should use simplest reasonable defaults."
+            job_scope += "\n\nASSUMPTIONS:\n- No clarifier answers were provided. Use the MINIMAL viable implementation — the simplest program that fulfills the literal request. Do NOT add frameworks, web servers, or infrastructure the user did not ask for."
 
         self.state["context"]['job_scope'] = job_scope
         self.state["context"]['clarification'] = job_scope  # Keep for backward compatibility
