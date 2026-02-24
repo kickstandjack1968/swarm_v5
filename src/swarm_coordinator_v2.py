@@ -754,6 +754,174 @@ class SwarmCoordinator:
             }
         }
 
+    @staticmethod
+    def _fix_missing_typing_imports(code: str) -> str:
+        """Auto-fix missing typing imports in Python code.
+
+        Scans for common typing names (Any, Dict, List, etc.) used in type hints
+        and ensures they're imported from typing. This catches one of the most
+        common LLM errors: using type annotations without importing them.
+        """
+        import re
+        # All common typing module names
+        typing_names = {
+            'Any', 'Dict', 'List', 'Tuple', 'Set', 'FrozenSet',
+            'Optional', 'Union', 'Callable', 'Iterator', 'Generator',
+            'Sequence', 'Mapping', 'MutableMapping', 'Iterable',
+            'Type', 'ClassVar', 'Final', 'Literal', 'TypeVar',
+            'Protocol', 'NamedTuple', 'TypedDict', 'Awaitable',
+            'Coroutine', 'AsyncIterator', 'AsyncGenerator',
+        }
+
+        lines = code.split('\n')
+
+        # Find which typing names are used in the code (outside strings/comments)
+        used_names = set()
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('#'):
+                continue
+            # Look for typing name usage patterns: annotations, generics
+            for name in typing_names:
+                # Match as standalone word (not part of a longer name)
+                if re.search(r'\b' + name + r'\b', line):
+                    used_names.add(name)
+
+        if not used_names:
+            return code
+
+        # Find existing typing imports
+        already_imported = set()
+        typing_import_line_idx = None
+        for i, line in enumerate(lines):
+            m = re.match(r'^from\s+typing\s+import\s+(.+)', line)
+            if m:
+                typing_import_line_idx = i
+                # Parse imported names (handle multi-line with parentheses later)
+                import_str = m.group(1).strip()
+                if import_str.startswith('('):
+                    import_str = import_str[1:]
+                import_str = import_str.rstrip(')')
+                for name in import_str.split(','):
+                    name = name.strip()
+                    if name:
+                        already_imported.add(name)
+
+        missing = used_names - already_imported
+        if not missing:
+            return code
+
+        if typing_import_line_idx is not None:
+            # Add missing names to existing import line
+            all_names = sorted(already_imported | missing)
+            new_import = f"from typing import {', '.join(all_names)}"
+            lines[typing_import_line_idx] = new_import
+        else:
+            # Add new typing import at the top (after any docstring and __future__)
+            insert_idx = 0
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith(('"""', "'''")):
+                    # Skip past docstring
+                    if stripped.count('"""') == 1 or stripped.count("'''") == 1:
+                        for j in range(i + 1, len(lines)):
+                            if '"""' in lines[j] or "'''" in lines[j]:
+                                insert_idx = j + 1
+                                break
+                    else:
+                        insert_idx = i + 1
+                elif stripped.startswith('from __future__'):
+                    insert_idx = i + 1
+                elif stripped.startswith(('import ', 'from ')):
+                    insert_idx = i  # Insert before first import
+                    break
+                elif stripped and not stripped.startswith('#'):
+                    insert_idx = i
+                    break
+
+            new_import = f"from typing import {', '.join(sorted(missing))}"
+            lines.insert(insert_idx, new_import)
+
+        return '\n'.join(lines)
+
+    @staticmethod
+    def _fix_missing_stdlib_imports(code: str) -> str:
+        """Auto-fix missing stdlib module imports.
+
+        Detects patterns like `json.loads(...)` or `os.path.join(...)` where
+        the module isn't imported and adds the import.
+        """
+        import re
+
+        # Map: module name -> usage patterns to detect
+        stdlib_modules = {
+            'json': r'\bjson\.',
+            'os': r'\bos\.',
+            'sys': r'\bsys\.',
+            'time': r'\btime\.(time|sleep|strftime|monotonic|perf_counter)\b',
+            'datetime': r'\bdatetime\.(datetime|date|time|timedelta)\b',
+            'logging': r'\blogging\.',
+            'hashlib': r'\bhashlib\.',
+            'base64': r'\bbase64\.',
+            'pathlib': r'\bpathlib\.',
+            'subprocess': r'\bsubprocess\.',
+            'threading': r'\bthreading\.',
+            'asyncio': r'\basyncio\.',
+            'sqlite3': r'\bsqlite3\.',
+            'math': r'\bmath\.',
+            're': r'\bre\.(match|search|findall|sub|compile|split|IGNORECASE|MULTILINE|DOTALL)\b',
+            'uuid': r'\buuid\.',
+            'tempfile': r'\btempfile\.',
+            'shutil': r'\bshutil\.',
+            'collections': r'\bcollections\.',
+            'functools': r'\bfunctools\.',
+            'itertools': r'\bitertools\.',
+            'copy': r'\bcopy\.(copy|deepcopy)\b',
+            'struct': r'\bstruct\.',
+            'io': r'\bio\.(BytesIO|StringIO|BufferedReader)\b',
+            'csv': r'\bcsv\.',
+            'secrets': r'\bsecrets\.',
+        }
+
+        lines = code.split('\n')
+
+        # Find already imported modules
+        imported = set()
+        for line in lines:
+            stripped = line.strip()
+            m = re.match(r'^import\s+(\w+)', stripped)
+            if m:
+                imported.add(m.group(1))
+            m = re.match(r'^from\s+(\w+)', stripped)
+            if m:
+                imported.add(m.group(1))
+
+        # Detect usage of unimported modules
+        missing = []
+        code_no_strings = re.sub(r'("""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"[^"]*"|\'[^\']*\')', '', code)
+        # Also remove comments
+        code_no_strings = re.sub(r'#.*', '', code_no_strings)
+
+        for module, pattern in stdlib_modules.items():
+            if module not in imported and re.search(pattern, code_no_strings):
+                missing.append(module)
+
+        if not missing:
+            return code
+
+        # Find insertion point (after existing imports)
+        insert_idx = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith(('import ', 'from ')):
+                insert_idx = i + 1
+
+        # Insert missing imports
+        for module in sorted(missing, reverse=True):
+            lines.insert(insert_idx, f'import {module}')
+
+        return '\n'.join(lines)
+
     def _generate_init_files(self, project_dir: str):
         """Auto-generate __init__.py for all folders with Python files."""
         import os
@@ -1005,10 +1173,14 @@ PROJECT STRUCTURE
                         base_dir = os.path.join(project_dir, "src")
 
                     code_file = os.path.join(base_dir, rel_path)
-                    
+
                     # Ensure directory exists
                     os.makedirs(os.path.dirname(code_file), exist_ok=True)
-                    
+
+                    # Validate Python syntax before saving
+                    if code_file.endswith('.py'):
+                        content = self._validate_and_fix_python_syntax(content)
+
                     with open(code_file, 'w', encoding='utf-8') as f:
                         f.write(content)
                 print(f"   ✓ Created {len(files_dict)} files (smart routed)")
@@ -1034,6 +1206,9 @@ PROJECT STRUCTURE
                     # Force into tests dir if not already
                     if not fname.startswith("tests/"):
                         fname = f"tests/{fname}"
+                    # Validate Python test file syntax
+                    if fname.endswith('.py'):
+                        content = self._validate_and_fix_python_syntax(content)
                     path = os.path.join(project_dir, fname)
                     os.makedirs(os.path.dirname(path), exist_ok=True)
                     with open(path, 'w', encoding='utf-8') as f:
@@ -1164,10 +1339,10 @@ PROJECT STRUCTURE
         """Parse coder output that contains multiple files."""
         files = {}
         
-        # Pattern 1: ### FILE: filename.py ###
-        file_pattern = r'###\s*FILE:\s*([^\s#]+)\s*###'
-        matches = list(re.finditer(file_pattern, code_output))
-        
+        # Pattern 1: ### FILE: filename.py ### (trailing ### optional)
+        file_pattern = r'###\s*FILE:\s*(\S+?)(?:\s*###)?\s*$'
+        matches = list(re.finditer(file_pattern, code_output, re.MULTILINE))
+
         if matches:
             for i, match in enumerate(matches):
                 filename = match.group(1).strip()
@@ -1526,32 +1701,83 @@ PROJECT STRUCTURE
             files.update(f.lower() for f in section_files)
         
         return files
-        
-        # Save requirements.txt
-        self._create_requirements_txt(project_dir)
-        
-        # Save session state
-        self.save_state()
-    
+
     def _create_requirements_txt(self, project_dir: str):
         """Generate requirements.txt with PINNED GOLDEN STACK versions."""
         code_task = next((t for t in self.completed_tasks if t.task_type in ("coding", "plan_execution")), None)
         if not code_task or not code_task.result:
             return
-        
+
         code = code_task.result
         imports = set()
-        
+
         # Scan imports
         for line in code.split('\n'):
             line = line.strip()
             if line.startswith('import ') or line.startswith('from '):
+                # Skip relative imports (from . or from .foo)
+                if line.startswith('from .'):
+                    continue
                 parts = line.split()
                 if len(parts) > 1:
                     mod = parts[1].split('.')[0].split(',')[0]
                     imports.add(mod)
 
-        stdlib = {'os', 'sys', 'json', 'time', 'datetime', 're', 'typing', 'logging', 'argparse', 'abc', 'enum', 'uuid', 'subprocess'}
+        # Build set of project-local module names from files in src/
+        project_modules = {'src', 'tests'}  # always exclude these package names
+        src_dir = os.path.join(project_dir, "src")
+        if os.path.isdir(src_dir):
+            for fname in os.listdir(src_dir):
+                if fname.endswith('.py') and fname != '__init__.py':
+                    project_modules.add(fname[:-3])  # strip .py
+        # Also extract module names from ### FILE: markers in the code output
+        import re as _re
+        for m in _re.findall(r'###\s*FILE:\s*(?:\S+/)?(\w+)\.py', code):
+            project_modules.add(m)
+        # Also check plan for file names
+        final_plan = self.state.get("context", {}).get("final_plan", "")
+        if final_plan:
+            for m in _re.findall(r'\b(\w+)\.py\b', final_plan):
+                project_modules.add(m)
+
+        # Complete Python stdlib set (3.10+)
+        stdlib = {
+            '__future__', '_thread', 'abc', 'aifc', 'argparse', 'array', 'ast',
+            'asynchat', 'asyncio', 'asyncore', 'atexit', 'audioop', 'base64',
+            'bdb', 'binascii', 'binhex', 'bisect', 'builtins', 'bz2',
+            'calendar', 'cgi', 'cgitb', 'chunk', 'cmath', 'cmd', 'code',
+            'codecs', 'codeop', 'collections', 'colorsys', 'compileall',
+            'concurrent', 'configparser', 'contextlib', 'contextvars', 'copy',
+            'copyreg', 'cProfile', 'crypt', 'csv', 'ctypes', 'curses',
+            'dataclasses', 'datetime', 'dbm', 'decimal', 'difflib', 'dis',
+            'distutils', 'doctest', 'email', 'encodings', 'enum', 'errno',
+            'faulthandler', 'fcntl', 'filecmp', 'fileinput', 'fnmatch',
+            'fractions', 'ftplib', 'functools', 'gc', 'getopt', 'getpass',
+            'gettext', 'glob', 'grp', 'gzip', 'hashlib', 'heapq', 'hmac',
+            'html', 'http', 'idlelib', 'imaplib', 'imghdr', 'imp',
+            'importlib', 'inspect', 'io', 'ipaddress', 'itertools', 'json',
+            'keyword', 'lib2to3', 'linecache', 'locale', 'logging',
+            'lzma', 'mailbox', 'mailcap', 'marshal', 'math', 'mimetypes',
+            'mmap', 'modulefinder', 'multiprocessing', 'netrc', 'nis',
+            'nntplib', 'numbers', 'operator', 'optparse', 'os', 'ossaudiodev',
+            'pathlib', 'pdb', 'pickle', 'pickletools', 'pipes', 'pkgutil',
+            'platform', 'plistlib', 'poplib', 'posix', 'posixpath', 'pprint',
+            'profile', 'pstats', 'pty', 'pwd', 'py_compile', 'pyclbr',
+            'pydoc', 'queue', 'quopri', 'random', 're', 'readline', 'reprlib',
+            'resource', 'rlcompleter', 'runpy', 'sched', 'secrets', 'select',
+            'selectors', 'shelve', 'shlex', 'shutil', 'signal', 'site',
+            'smtpd', 'smtplib', 'sndhdr', 'socket', 'socketserver', 'spwd',
+            'sqlite3', 'ssl', 'stat', 'statistics', 'string', 'stringprep',
+            'struct', 'subprocess', 'sunau', 'symtable', 'sys', 'sysconfig',
+            'syslog', 'tabnanny', 'tarfile', 'telnetlib', 'tempfile',
+            'termios', 'test', 'textwrap', 'threading', 'time', 'timeit',
+            'tkinter', 'token', 'tokenize', 'tomllib', 'trace', 'traceback',
+            'tracemalloc', 'tty', 'turtle', 'turtledemo', 'types', 'typing',
+            'unicodedata', 'unittest', 'urllib', 'uu', 'uuid', 'venv',
+            'warnings', 'wave', 'weakref', 'webbrowser', 'winreg', 'winsound',
+            'wsgiref', 'xdrlib', 'xml', 'xmlrpc', 'zipapp', 'zipfile',
+            'zipimport', 'zlib',
+        }
 
         # GOLDEN STACK: Pinned versions that are guaranteed to work together
         pinned_versions = {
@@ -1567,22 +1793,59 @@ PROJECT STRUCTURE
             "bcrypt": "bcrypt==4.0.1",  # CRITICAL: 4.1.0+ is incompatible with passlib
             "python_multipart": "python-multipart>=0.0.7",
             "python_dotenv": "python-dotenv>=1.0.0",
-            "pytest": "pytest>=8.0.0"
+            "pytest": "pytest>=8.0.0",
+            "numpy": "numpy>=1.26.0",
+            "pandas": "pandas>=2.2.0",
+            "scikit_learn": "scikit-learn>=1.4.0",
+            "cryptography": "cryptography>=42.0.0",
+            "requests": "requests>=2.31.0",
+            "flask": "flask>=3.0.0",
+            "jinja2": "jinja2>=3.1.3",
+            "click": "click>=8.1.7",
+            "aiohttp": "aiohttp>=3.9.0",
+            "redis": "redis>=5.0.0",
+            "celery": "celery>=5.3.0",
+            "httpx": "httpx>=0.27.0",
+            "websockets": "websockets>=12.0",
+            "pyyaml": "pyyaml>=6.0.1",
+            "pillow": "Pillow>=10.2.0",
+            "matplotlib": "matplotlib>=3.8.0",
+            "scipy": "scipy>=1.12.0",
+            "networkx": "networkx>=3.2.0",
+            "psutil": "psutil>=5.9.0",
+            "beautifulsoup4": "beautifulsoup4>=4.12.0",
+            "lxml": "lxml>=5.1.0",
+            "paramiko": "paramiko>=3.4.0",
+            "boto3": "boto3>=1.34.0",
+            "opencv_python": "opencv-python>=4.9.0",
+            "torch": "torch>=2.2.0",
+            "transformers": "transformers>=4.38.0",
+            "sentence_transformers": "sentence-transformers>=2.3.0",
         }
 
+        # Map import names to pinned_versions keys
         package_map = {
             "dotenv": "python_dotenv",
             "multipart": "python_multipart",
             "jose": "python_jose",
             "jwt": "python_jose",
-            "psycopg2": "psycopg2" 
+            "psycopg2": "psycopg2",
+            "yaml": "pyyaml",
+            "sklearn": "scikit_learn",
+            "cv2": "opencv_python",
+            "PIL": "pillow",
+            "bs4": "beautifulsoup4",
+            "sentence_transformers": "sentence_transformers",
         }
 
         final_reqs = set()
         for imp in imports:
-            if imp in stdlib: continue
+            if imp in stdlib:
+                continue
+            if imp in project_modules:
+                continue
             pkg_key = package_map.get(imp, imp)
-            
+
             # If Pydantic is detected, ensure pydantic-settings is added for V2 support
             if imp == "pydantic" and "BaseSettings" in code:
                 final_reqs.add(pinned_versions["pydantic_settings"])
@@ -1698,6 +1961,14 @@ PROJECT STRUCTURE
                 exp_type = exp.type if hasattr(exp, 'type') else 'unknown'
                 exp_name = exp.name if hasattr(exp, 'name') else str(exp)
                 parts.append(f"  - {exp_name} ({exp_type})")
+                # Include method signatures so reviewer can verify them
+                methods = exp.methods if hasattr(exp, 'methods') else {}
+                if methods:
+                    for method_name, method_info in methods.items():
+                        args = method_info.get('args', [])
+                        returns = method_info.get('returns', '')
+                        ret_hint = f" -> {returns}" if returns else ""
+                        parts.append(f"    signature: {method_name}({', '.join(args)}){ret_hint}")
 
         if file_spec.imports_from:
             parts.append("\nImports From:")
@@ -1863,6 +2134,18 @@ PROJECT STRUCTURE
                     if f.endswith(".py"):
                         self.sandbox.copy_to_container(os.path.join(tests_local, f), f"/workspace/tests/{f}")
 
+            # Install project requirements if requirements.txt exists
+            req_file = os.path.join(project_dir, "requirements.txt")
+            if os.path.exists(req_file):
+                self.sandbox.copy_to_container(req_file, "/workspace/requirements.txt")
+                print("   📦 Installing project dependencies in sandbox...")
+                install_result = self.sandbox._exec(
+                    ["pip", "install", "--quiet", "-r", "/workspace/requirements.txt"],
+                    timeout=180
+                )
+                if install_result.returncode != 0:
+                    print(f"   ⚠ Some dependencies failed to install: {install_result.stderr[:200]}")
+
             # 2. Run Pytest in Docker
             # We use the sandbox's internal run_pytest or raw _exec
             code, output = self.sandbox.run_pytest("/workspace/tests")
@@ -1882,8 +2165,12 @@ PROJECT STRUCTURE
                 with open(entry_path, "r") as f:
                     entry_code = f.read()
                 has_cli_framework = any(fw in entry_code for fw in ("argparse", "click", "typer"))
+                # Server frameworks start long-running processes — not suitable for --help
+                is_server = any(fw in entry_code for fw in ("uvicorn", "gunicorn", "flask.run", "Django", "FastAPI"))
+                if is_server:
+                    has_cli_framework = False
             except Exception:
-                has_cli_framework = True  # If we can't read, run the test anyway
+                has_cli_framework = False  # If we can't read, skip rather than hang
 
             if has_cli_framework:
                 # Convert src/main.py -> src.main
@@ -1946,8 +2233,12 @@ PROJECT STRUCTURE
                 with open(entry_path, "r") as f:
                     entry_code = f.read()
                 has_cli_framework = any(fw in entry_code for fw in ("argparse", "click", "typer"))
+                # Server frameworks start long-running processes — not suitable for --help
+                is_server = any(fw in entry_code for fw in ("uvicorn", "gunicorn", "flask.run", "Django", "FastAPI"))
+                if is_server:
+                    has_cli_framework = False
             except Exception:
-                has_cli_framework = True  # If we can't read, run the test anyway
+                has_cli_framework = False  # If we can't read, skip rather than hang
 
             if has_cli_framework:
                 module_path = entry_point.replace("/", ".").replace("\\", ".").rstrip(".py")
@@ -2187,6 +2478,10 @@ PROJECT STRUCTURE
                     # revision, anti-stub detection, and proper __init__.py generation
                     try:
                         pe = PlanExecutor(self.executor, self.config)
+                        # Wire up prompt logging
+                        project_dir = self.state["project_info"].get("project_dir")
+                        if project_dir:
+                            pe.prompt_log_dir = os.path.join(project_dir, "prompt_logs")
                         result = pe.execute(final_plan, user_request=user_request, job_scope=job_spec)
 
                         combined_output = result.get("combined_output", "")
@@ -2625,33 +2920,145 @@ Be specific and reference actual code from the project."""
                     return (len(failing) > 0), failing
 
                 failed, failing_list = _smoke_failed(smoke_tests)
-                
+
                 if failed:
+                    # Collect error details for revision feedback
+                    error_details = []
+                    for name, info in smoke_tests.items():
+                        rc = info.get("returncode", None)
+                        if rc != 0:
+                            detail = f"Test '{name}' failed (rc={rc})"
+                            detail += f"\nCommand: {info.get('cmd')}"
+                            stdout = (info.get("stdout") or "").strip()
+                            stderr = (info.get("stderr") or "").strip()
+                            if stdout:
+                                detail += f"\nstdout:\n{stdout[:3000]}"
+                            if stderr:
+                                detail += f"\nstderr:\n{stderr[:3000]}"
+                            error_details.append(detail)
+
+                    error_feedback = "\n\n".join(error_details)
+
                     print("\n" + "=" * 80)
-                    print("❌ SMOKE TESTS FAILED - AUTO-REJECTING")
+                    print("❌ SMOKE TESTS FAILED")
                     print("=" * 80)
-                    print("Smoke tests failed:")
                     for item in failing_list:
                         print(f" - {item}")
-                    print("\nSmoke test details:")
-                    for name, info in smoke_tests.items():
-                        print("-" * 40)
-                        print(f"{name}: {info.get('cmd')}")
-                        print(f"returncode: {info.get('returncode')}")
-                        stdout = (info.get("stdout") or "").strip()
-                        stderr = (info.get("stderr") or "").strip()
-                        if stdout:
-                            print("stdout:")
-                            print(stdout[:4000])
-                        if stderr:
-                            print("stderr:")
-                            print(stderr[:4000])
+                    print(error_feedback[:4000])
                     print("=" * 80)
 
-                    task.status = TaskStatus.FAILED
-                    task.error = "Smoke tests failed: " + ", ".join(failing_list)
-                    task.completed_at = time.time()
-                    return task
+                    # Find the code task to check revision count
+                    code_task = next((t for t in reversed(self.completed_tasks)
+                                      if t.task_type in ("coding", "plan_execution", "build_from_plan")), None)
+
+                    if code_task and code_task.revision_count < code_task.max_revisions:
+                        print(f"\n🔄 Triggering revision {code_task.revision_count + 1}/{code_task.max_revisions} based on smoke test errors")
+
+                        revision_metadata = {
+                            "revision_feedback": (
+                                "SMOKE TESTS FAILED. Fix these errors:\n\n"
+                                + error_feedback
+                                + "\n\nIMPORTANT: Fix the EXACT errors shown above. "
+                                "Do NOT change code that is working. Only fix what is broken."
+                            ),
+                            "original_code": code_task.result,
+                            "user_request": self.state["context"].get("user_request", ""),
+                            "is_revision": True,
+                        }
+                        if self.state["context"].get("final_plan"):
+                            revision_metadata["final_plan"] = self.state["context"]["final_plan"]
+
+                        revision_task = Task(
+                            task_id=f"T_revision_smoke_{code_task.revision_count + 1}",
+                            task_type="revision",
+                            description="Fix code based on smoke test failures",
+                            assigned_role=AgentRole.CODER,
+                            status=TaskStatus.PENDING,
+                            priority=10,
+                            metadata=revision_metadata
+                        )
+                        revision_task.revision_count = code_task.revision_count + 1
+
+                        self.execute_task(revision_task)
+
+                        if revision_task.status == TaskStatus.COMPLETED and revision_task.result:
+                            # Merge revised code back
+                            original_files = self._parse_multi_file_output(code_task.result or "")
+                            revised_files = self._parse_multi_file_output(revision_task.result)
+
+                            if not revised_files and revision_task.result.strip():
+                                # Revision output has no ### FILE: markers — try to
+                                # match it to original files or treat as full replacement
+                                raw = revision_task.result.strip()
+                                # Clean markdown fences if present
+                                raw = re.sub(r'^```(?:python)?\s*\n', '', raw)
+                                raw = re.sub(r'\n```\s*$', '', raw)
+
+                                if original_files:
+                                    # If original had multiple files, wrap raw output
+                                    # using original filenames as markers and re-parse
+                                    # Check if raw output contains any original filenames as hints
+                                    matched_any = False
+                                    for fname in original_files:
+                                        if fname in raw or fname.replace('.py', '') in raw:
+                                            matched_any = True
+                                            break
+
+                                    if not matched_any and len(original_files) == 1:
+                                        # Single-file project: use the one filename
+                                        only_name = list(original_files.keys())[0]
+                                        revised_files = {only_name: raw}
+                                    else:
+                                        # Multi-file: replace entire code_task result
+                                        # and let _save_project_outputs re-parse
+                                        code_task.result = raw
+                                        revised_files = None  # signal to skip merge
+                                else:
+                                    # No original files parsed either — store raw
+                                    code_task.result = raw
+                                    revised_files = None
+
+                            if revised_files:
+                                merged = {**original_files, **revised_files}
+                                # Rebuild combined output
+                                merged_parts = []
+                                for fname, content in merged.items():
+                                    merged_parts.append(f"### FILE: {fname}\n```python\n{content}\n```")
+                                code_task.result = "\n\n".join(merged_parts)
+
+                            # Update state and re-save
+                            code_task.revision_count = revision_task.revision_count
+                            self._update_context(code_task)
+                            self._save_project_outputs()
+
+                            # Re-run smoke tests
+                            print("\n🔁 Re-running smoke tests after revision...")
+                            smoke_tests = self._run_smoke_tests()
+                            task.metadata["smoke_tests"] = smoke_tests
+                            failed, failing_list = _smoke_failed(smoke_tests)
+
+                            if not failed:
+                                print("✓ Smoke tests pass after revision!")
+                                # Fall through to external agent verification below
+                            else:
+                                print(f"❌ Smoke tests still failing after revision: {', '.join(failing_list)}")
+                                task.status = TaskStatus.FAILED
+                                task.error = "Smoke tests failed after revision: " + ", ".join(failing_list)
+                                task.completed_at = time.time()
+                                return task
+                        else:
+                            print("  ⚠ Revision task failed")
+                            task.status = TaskStatus.FAILED
+                            task.error = "Smoke tests failed, revision failed"
+                            task.completed_at = time.time()
+                            return task
+                    else:
+                        if code_task:
+                            print(f"\n⚠ Max revisions ({code_task.max_revisions}) reached, no more retries")
+                        task.status = TaskStatus.FAILED
+                        task.error = "Smoke tests failed: " + ", ".join(failing_list)
+                        task.completed_at = time.time()
+                        return task
 
                 # Continue to External Agent (smoke tests passed)
                 system_prompt, user_message = self._get_verifier_prompt(task)
@@ -2755,36 +3162,60 @@ Be specific and reference actual code from the project."""
                     if not PLAN_EXECUTOR_AVAILABLE:
                         raise Exception("Plan executor not available - ensure plan_executor.py is in the same directory")
                 system_prompt = ARCHITECT_PLAN_SYSTEM_PROMPT
-                user_message = get_architect_plan_prompt(
-                    task.metadata.get('user_request', ''), 
+                base_user_message = get_architect_plan_prompt(
+                    task.metadata.get('user_request', ''),
                     self.state["context"].get('clarification', '')
                     )
                 architect_config = self.executor._get_agent_config(AgentRole.ARCHITECT)
-                payload = {
-                        "system_prompt": system_prompt,
-                        "user_message": user_message,
-                        "config": {
-                            "model_url": architect_config.get("url", "http://localhost:1233/v1"),
-                            "model_name": architect_config.get("model", "local-model"),
-                            "api_type": architect_config.get("api_type", "openai"),
-                            "temperature": 0.6,
-                            "max_tokens": 3000,
-                            "timeout": architect_config.get("timeout", 600)
-                        }
-                    }
 
-                output = self._run_external_agent("architect", payload)
-                if output.get("status") == "error":
-                    raise Exception(output.get("error"))
-                result_text = output.get("result", "")
-                plan_yaml = extract_yaml_from_response(result_text)
-                self.state["context"]["plan_yaml"] = plan_yaml
-                task.result = plan_yaml
-                self._set_project_type_from_plan(plan_yaml)
-                task.status = TaskStatus.COMPLETED
-                task.completed_at = time.time()
-                self._update_context(task)
-                return task
+                max_architect_retries = 3
+                last_error = None
+                for attempt in range(max_architect_retries):
+                    user_message = base_user_message
+                    if last_error:
+                        user_message += (
+                            f"\n\n{'='*60}\n"
+                            f"YOUR PREVIOUS PLAN FAILED VALIDATION (attempt {attempt + 1}/{max_architect_retries}):\n"
+                            f"{last_error}\n"
+                            f"{'='*60}\n"
+                            f"Fix this error. Every file's imports_from must only reference "
+                            f"names that appear in the source file's exports list.\n"
+                        )
+                        print(f"  🔄 Architect retry {attempt + 1}/{max_architect_retries}: {last_error[:120]}")
+
+                    payload = {
+                            "system_prompt": system_prompt,
+                            "user_message": user_message,
+                            "config": {
+                                "model_url": architect_config.get("url", "http://localhost:1233/v1"),
+                                "model_name": architect_config.get("model", "local-model"),
+                                "api_type": architect_config.get("api_type", "openai"),
+                                "temperature": 0.6,
+                                "max_tokens": 3000,
+                                "timeout": architect_config.get("timeout", 600)
+                            }
+                        }
+
+                    output = self._run_external_agent("architect", payload)
+                    if output.get("status") == "error":
+                        error_msg = output.get("error", "")
+                        if "Validation error" in error_msg and attempt < max_architect_retries - 1:
+                            last_error = error_msg
+                            continue
+                        raise Exception(error_msg)
+
+                    result_text = output.get("result", "")
+                    plan_yaml = extract_yaml_from_response(result_text)
+                    self.state["context"]["plan_yaml"] = plan_yaml
+                    task.result = plan_yaml
+                    self._set_project_type_from_plan(plan_yaml)
+                    task.status = TaskStatus.COMPLETED
+                    task.completed_at = time.time()
+                    self._update_context(task)
+                    return task
+
+                # All retries exhausted
+                raise Exception(f"Architect failed after {max_architect_retries} attempts: {last_error}")
 
             # --- 4. CODER TASK (External: Coder) ---
             if task.assigned_role == AgentRole.CODER:
@@ -2804,7 +3235,7 @@ Be specific and reference actual code from the project."""
                         "model_name": coder_config.get("model", "local-model"),
                         "api_type": coder_config.get("api_type", "openai"),
                         "temperature": 0.5,
-                        "max_tokens": 6000,
+                        "max_tokens": coder_config.get("max_tokens", 25000),
                         "timeout": coder_config.get("timeout", 1200)
                     }
                 }
@@ -2873,7 +3304,7 @@ Be specific and reference actual code from the project."""
                         "model_url": reviewer_config.get("url", "http://localhost:1233/v1"),
                         "model_name": reviewer_config.get("model", "local-model"),
                         "api_type": reviewer_config.get("api_type", "openai"),
-                        "temperature": 0.8,
+                        "temperature": 0.3,
                         "max_tokens": 3000,
                         "timeout": reviewer_config.get("timeout", 600)
                     }
@@ -2882,7 +3313,7 @@ Be specific and reference actual code from the project."""
                 try:
                     # Generic Call
                     output = self._run_external_agent("reviewer", payload)
-                    
+
                     if output.get("status") == "error":
                         raise Exception(output.get("error"))
                     
@@ -3302,7 +3733,169 @@ Be specific and reference actual code from the project."""
                 break
         
         cleaned_lines = lines[start_idx:end_idx if end_idx != len(lines) else None]
-        return '\n'.join(cleaned_lines).rstrip()
+        cleaned = '\n'.join(cleaned_lines).rstrip()
+
+        # Syntax validation: try to compile, attempt fixes if broken
+        cleaned = self._validate_and_fix_python_syntax(cleaned)
+        return cleaned
+
+    def _validate_and_fix_python_syntax(self, code: str) -> str:
+        """Validate Python syntax and fix common LLM errors."""
+        import ast
+
+        # Fix missing typing imports (causes NameError at runtime even if syntax is valid)
+        code = self._fix_missing_typing_imports(code)
+        # Fix missing stdlib imports (e.g. json.loads used without import json)
+        code = self._fix_missing_stdlib_imports(code)
+
+        # First check: is it already valid?
+        try:
+            ast.parse(code)
+            return code
+        except SyntaxError:
+            pass
+
+        # Fix attempt 1: Mismatched brackets across the whole file
+        # Common LLM error: [{'key': val]}  should be  [{'key': val}]
+        fixed = self._fix_brackets_whole_file(code)
+
+        try:
+            ast.parse(fixed)
+            return fixed
+        except SyntaxError:
+            pass
+
+        # Fix attempt 2: Remove lines that cause syntax errors one at a time
+        # (last resort - try to salvage what we can)
+        lines = fixed.split('\n')
+        max_attempts = 10
+        for _ in range(max_attempts):
+            try:
+                ast.parse('\n'.join(lines))
+                return '\n'.join(lines)
+            except SyntaxError as e:
+                if e.lineno and 1 <= e.lineno <= len(lines):
+                    # Comment out the broken line
+                    bad_idx = e.lineno - 1
+                    lines[bad_idx] = '# SYNTAX_FIX: ' + lines[bad_idx]
+                else:
+                    break
+
+        # If all fixes fail, return original (will fail at smoke test, trigger revision)
+        return code
+
+    @staticmethod
+    def _fix_brackets_whole_file(code: str) -> str:
+        """Fix mismatched brackets in LLM-generated Python code.
+
+        Uses targeted fixes at SyntaxError locations:
+        1. Swap adjacent mismatched bracket pairs (e.g. ]} -> }])
+        2. Remove extra closers one at a time
+        3. Re-parse after each attempt
+        """
+        import ast
+
+        max_fix_rounds = 15
+        current = code
+
+        for _ in range(max_fix_rounds):
+            try:
+                ast.parse(current)
+                return current
+            except SyntaxError as e:
+                if not e.lineno:
+                    return current
+
+                lines = current.split('\n')
+                err_line_idx = e.lineno - 1
+                if err_line_idx < 0 or err_line_idx >= len(lines):
+                    return current
+
+                err_line = lines[err_line_idx]
+                fixed_line = None
+
+                # Strategy 1: Swap adjacent mismatched bracket pairs
+                # e.g. ]} -> }]  or )} -> })  or ]) -> )]
+                bracket_chars = set('()[]{}')
+                for j in range(len(err_line) - 1):
+                    a, b = err_line[j], err_line[j + 1]
+                    if a in bracket_chars and b in bracket_chars and a != b:
+                        # Try swapping
+                        candidate = err_line[:j] + b + a + err_line[j + 2:]
+                        lines[err_line_idx] = candidate
+                        test_code = '\n'.join(lines)
+                        try:
+                            ast.parse(test_code)
+                            return test_code
+                        except SyntaxError:
+                            pass
+                        lines[err_line_idx] = err_line  # restore
+
+                # Strategy 2: Replace each closer with each other closer type
+                # e.g. ) -> ] or } -> ) when the bracket type is wrong
+                closer_types = [')', ']', '}']
+                for j in range(len(err_line)):
+                    if err_line[j] in closer_types:
+                        for replacement in closer_types:
+                            if replacement != err_line[j]:
+                                candidate = err_line[:j] + replacement + err_line[j + 1:]
+                                lines[err_line_idx] = candidate
+                                test_code = '\n'.join(lines)
+                                try:
+                                    ast.parse(test_code)
+                                    return test_code
+                                except SyntaxError:
+                                    pass
+                                lines[err_line_idx] = err_line
+
+                # Strategy 3: Try removing each closer on the error line one at a time
+                closer_positions = [j for j, c in enumerate(err_line) if c in ')]}']
+                for j in closer_positions:
+                    candidate = err_line[:j] + err_line[j + 1:]
+                    lines[err_line_idx] = candidate
+                    test_code = '\n'.join(lines)
+                    try:
+                        ast.parse(test_code)
+                        return test_code
+                    except SyntaxError:
+                        pass
+                    lines[err_line_idx] = err_line  # restore
+
+                # Strategy 4: Also check previous line (error often reported on next line)
+                if err_line_idx > 0:
+                    prev_line = lines[err_line_idx - 1]
+                    prev_closer_positions = [j for j, c in enumerate(prev_line) if c in ')]}']
+                    for j in reversed(prev_closer_positions):
+                        candidate = prev_line[:j] + prev_line[j + 1:]
+                        lines[err_line_idx - 1] = candidate
+                        test_code = '\n'.join(lines)
+                        try:
+                            ast.parse(test_code)
+                            return test_code
+                        except SyntaxError:
+                            pass
+                        lines[err_line_idx - 1] = prev_line  # restore
+
+                # Strategy 5: Swap on previous line too
+                if err_line_idx > 0:
+                    prev_line = lines[err_line_idx - 1]
+                    for j in range(len(prev_line) - 1):
+                        a, b = prev_line[j], prev_line[j + 1]
+                        if a in bracket_chars and b in bracket_chars and a != b:
+                            candidate = prev_line[:j] + b + a + prev_line[j + 2:]
+                            lines[err_line_idx - 1] = candidate
+                            test_code = '\n'.join(lines)
+                            try:
+                                ast.parse(test_code)
+                                return test_code
+                            except SyntaxError:
+                                pass
+                            lines[err_line_idx - 1] = prev_line
+
+                # No fix found for this error, give up
+                return current
+
+        return current
 
     def execute_tasks_parallel(self, tasks: List[Task]) -> List[Task]:
         """Execute multiple tasks in parallel"""
@@ -3540,6 +4133,10 @@ Be specific and reference actual code from the project."""
             # Update the context with merged code
             self._update_context(revision_task)
             self.completed_tasks.append(revision_task)
+
+            # Re-validate revised code with a fresh compliance review
+            self._revalidate_after_revision()
+
             return True
 
         return False
@@ -3808,6 +4405,10 @@ Be specific and reference actual code from the project."""
 
         # Instantiate PlanExecutor with the coordinator's executor and config
         pe = PlanExecutor(self.executor, self.config)
+        # Wire up prompt logging
+        project_dir = self.state["project_info"].get("project_dir")
+        if project_dir:
+            pe.prompt_log_dir = os.path.join(project_dir, "prompt_logs")
         try:
             pe.plan = pe.parse_plan(final_plan)
         except Exception as e:
@@ -3830,6 +4431,7 @@ Be specific and reference actual code from the project."""
                 )
 
         revised_count = 0
+        still_failing = []
 
         for fname in failed_files:
             file_spec = pe._get_file_spec(fname)
@@ -3893,12 +4495,21 @@ Be specific and reference actual code from the project."""
 
                 try:
                     revised = pe._handle_revision(file_spec, file_result, context, user_request)
-                    if revised.content and revised.status in (FileStatus.COMPLETED, FileStatus.PLAN_MISMATCH):
+                    if revised.content and revised.status == FileStatus.COMPLETED:
                         all_files[fname] = revised.content
                         pe.completed_files[fname] = revised
                         revised_count += 1
-                        print(f"    ✓ {fname}: revised ({len(revised.content)} chars, status={revised.status.value})")
+                        print(f"    ✓ {fname}: revised ({len(revised.content)} chars)")
+                    elif revised.content and revised.status == FileStatus.PLAN_MISMATCH:
+                        # Partially improved but still failing compliance —
+                        # update the code (may help dependent files) but don't
+                        # count as success so coordinator can retry
+                        all_files[fname] = revised.content
+                        pe.completed_files[fname] = revised
+                        still_failing.append(fname)
+                        print(f"    ⚠ {fname}: revised but still failing compliance ({len(revised.content)} chars)")
                     else:
+                        still_failing.append(fname)
                         print(f"    ✗ {fname}: revision produced no content")
                 except Exception as e:
                     print(f"    ✗ {fname}: revision error ({e})")
@@ -3909,7 +4520,7 @@ Be specific and reference actual code from the project."""
                 "file_code": all_files.get(fname, "")[:2000]
             }, mode="file_revision")
 
-        if revised_count == 0:
+        if revised_count == 0 and not still_failing:
             return False
 
         # Post-revision cross-file integration validation
@@ -3941,11 +4552,16 @@ Be specific and reference actual code from the project."""
 
                     try:
                         revised = pe._handle_revision(file_spec, file_result, context, user_request)
-                        if revised.content and revised.status in (FileStatus.COMPLETED, FileStatus.PLAN_MISMATCH):
+                        if revised.content and revised.status == FileStatus.COMPLETED:
                             all_files[ifname] = revised.content
                             pe.completed_files[ifname] = revised
                             integration_revised += 1
                             print(f"    ✓ {ifname}: integration-revised ({len(revised.content)} chars)")
+                        elif revised.content:
+                            # Partially improved — update code but don't count as fixed
+                            all_files[ifname] = revised.content
+                            pe.completed_files[ifname] = revised
+                            print(f"    ⚠ {ifname}: integration-revised but still failing")
                     except Exception as e:
                         print(f"    ✗ {ifname}: integration revision error ({e})")
 
@@ -3983,10 +4599,62 @@ Be specific and reference actual code from the project."""
         try:
             self._save_project_outputs()
             print(f"  ✓ File-by-file revision complete: {revised_count}/{len(failed_files)} files revised, all {len(all_files)} files saved")
+            if still_failing:
+                print(f"  ⚠ Still failing compliance: {', '.join(still_failing)}")
         except Exception as e:
             print(f"  ⚠ Save after revision failed: {e}")
 
-        return True
+        # Re-validate revised code with a fresh compliance review
+        self._revalidate_after_revision()
+
+        # Only report success if all failed files were fully fixed
+        return len(still_failing) == 0 and revised_count > 0
+
+    def _revalidate_after_revision(self):
+        """
+        Run a fresh compliance review after revision to verify fixes.
+        Creates a new compliance_review task, executes it, and appends results.
+        """
+        print(f"\n🔍 Re-validating revised code...")
+
+        revalidation_task = Task(
+            task_id=f"T_revalidation_{int(time.time())}",
+            task_type="compliance_review",
+            description="Post-revision compliance re-validation",
+            assigned_role=AgentRole.REVIEWER,
+            status=TaskStatus.PENDING,
+            priority=10,
+            metadata={
+                "user_request": self.state["context"].get("user_request", ""),
+                "is_revalidation": True
+            }
+        )
+
+        try:
+            self.execute_task(revalidation_task)
+
+            if revalidation_task.status == TaskStatus.COMPLETED:
+                self.completed_tasks.append(revalidation_task)
+
+                still_needs_revision = revalidation_task.metadata.get("needs_revision", False)
+                failed_files = revalidation_task.metadata.get("failed_files", [])
+
+                if still_needs_revision and failed_files:
+                    print(f"  ⚠ Re-validation: {len(failed_files)} file(s) still have issues: {', '.join(failed_files)}")
+                else:
+                    print(f"  ✓ Re-validation: all files pass compliance review")
+
+                # Update stored review results in context
+                if revalidation_task.result:
+                    self.state["context"]["compliance_review_reviewer"] = {
+                        "task_id": revalidation_task.task_id,
+                        "result": revalidation_task.result,
+                        "completed_at": revalidation_task.completed_at or time.time()
+                    }
+            else:
+                print(f"  ⚠ Re-validation task did not complete (status: {revalidation_task.status.value})")
+        except Exception as e:
+            print(f"  ⚠ Re-validation failed: {e}")
 
     def run_workflow(self, user_request: str, workflow_type: str = "standard", stop_after: str = None):
         """Execute a complete workflow.
@@ -4189,10 +4857,22 @@ Be specific and reference actual code from the project."""
                 dependencies=["T003_code"],
                 metadata={"reviewer_number": i, "user_request": user_request}
             ))
-        
-        # Task 7: Documentation
+
+        # Task 7: Test generation (parallel with reviews)
         self.add_task(Task(
-            task_id="T007_document",
+            task_id="T007_tests",
+            task_type="test_generation",
+            description="Generate tests",
+            assigned_role=AgentRole.TESTER,
+            status=TaskStatus.PENDING,
+            priority=7,
+            dependencies=["T003_code"],
+            metadata={"user_request": user_request}
+        ))
+
+        # Task 8: Documentation
+        self.add_task(Task(
+            task_id="T008_document",
             task_type="documentation",
             description="Generate documentation",
             assigned_role=AgentRole.DOCUMENTER,
@@ -4201,16 +4881,16 @@ Be specific and reference actual code from the project."""
             dependencies=["T004_review1", "T005_review2", "T006_review3"],
             metadata={"user_request": user_request}
         ))
-        
-        # Task 8: Verification
+
+        # Task 9: Verification
         self.add_task(Task(
-            task_id="T008_verify",
+            task_id="T009_verify",
             task_type="verification",
             description="Verify docs match code",
             assigned_role=AgentRole.VERIFIER,
             status=TaskStatus.PENDING,
             priority=5,
-            dependencies=["T007_document"]
+            dependencies=["T007_tests", "T008_document"]
         ))
     
     def _create_full_workflow(self, user_request: str):
@@ -4425,14 +5105,15 @@ Be specific and reference actual code from the project."""
         if role == AgentRole.CODER and is_revision:
             return """You are an expert programmer performing a CODE REVISION.
 
-YOUR TASK: Fix the issues identified by the code reviewer.
+YOUR TASK: Fix the SPECIFIC BUGS identified by the code reviewer.
 
 CRITICAL REVISION RULES:
-1. The reviewer has REJECTED your previous code - you MUST address their feedback
-2. If the reviewer provided corrected code, USE IT - don't reinvent
-3. Every issue mentioned in the review MUST be fixed
-4. Do not argue with the review - implement the fixes
-5. Output COMPLETE files, not partial patches
+1. The reviewer has found bugs in your code - fix ONLY those bugs
+2. Do NOT rewrite working code. If a function works correctly, leave it alone
+3. IGNORE any replacement code the reviewer suggests - write your own fix based on the bug description
+4. If the reviewer's complaint is vague or doesn't describe an actual bug, keep your original code
+5. Before changing anything, mentally test: does the current code actually fail? If not, don't change it
+6. Output COMPLETE files, not partial patches
 
 OUTPUT FORMAT:
 - Use ### FILE: filename.py ### headers for each file
@@ -4441,11 +5122,12 @@ OUTPUT FORMAT:
 
 QUALITY REQUIREMENTS:
 1. The revised code must be immediately executable
-2. All reviewer concerns must be addressed
-3. Preserve working parts of the original code
-4. Test mentally before outputting
+2. Fix actual bugs, not style preferences
+3. Preserve ALL working code - do not replace working approaches with different ones
+4. Mentally test your code with real inputs before outputting
+5. If the original code passes "2 + 3" and returns 5, the revised code must too
 
-Focus on implementing the reviewer's feedback completely and correctly."""  
+The goal is to fix bugs, not rewrite the program."""
 # Here
         is_modify = task_metadata.get("mode") == "modify_existing" if task_metadata else False
         if role == AgentRole.CODER and is_modify:
@@ -4542,6 +5224,8 @@ CRITICAL QUALITY RULES:
 3. Do not add unrequested features
 4. Handle edge cases: None inputs, missing files, etc.
 5. If external files are needed, handle their absence gracefully
+6. For FastAPI/uvicorn servers: use `uvicorn.run()` directly (NOT inside asyncio.run()). The if __name__ block should call uvicorn.run(app, host=host, port=port) synchronously.
+7. Match ALL bracket types carefully: every ( needs ), every [ needs ], every { needs }
 
 EXAMPLE OUTPUT FOR CONFIG FILES:
 ### FILE: config.json ###
@@ -4589,24 +5273,36 @@ OUTPUT RULES:
 
 Make it work.""",
 
-            AgentRole.REVIEWER: """You are a code reviewer. Your role is to:
-- Find BUGS - syntax errors, logic errors, missing imports, unhandled exceptions
-- Verify code actually WORKS - trace through execution mentally
-- Check if code matches requirements (not over-engineered, not under-engineered)
-- Identify missing error handling for realistic failures
-- Verify external dependencies are handled correctly
+            AgentRole.REVIEWER: """You are a code reviewer. Your job is to determine if the code WORKS CORRECTLY.
 
-CRITICAL CHECKS:
-1. Will this code run without errors? Test mentally.
-2. What if required files don't exist? What if inputs are None/empty?
-3. Does this match what the user asked for?
-4. Are there syntax errors, typos, or undefined variables?
-5. Will the code produce the expected output?
+REVIEW PROCESS:
+1. Mentally trace through the code with sample inputs. Does it produce correct output?
+2. Check for actual bugs: syntax errors, logic errors, missing imports, crashes
+3. Verify it matches what the user asked for
 
-Return STATUS: APPROVED if code is correct and matches requirements.
-Return STATUS: NEEDS_REVISION with SPECIFIC bugs/issues if found.
+APPROVE if:
+- The code runs without errors
+- It produces correct results for normal inputs
+- It handles obvious error cases (empty input, division by zero, etc.)
+- It meets the stated requirements
 
-Be thorough - broken code getting through is a critical failure.""",
+REJECT only for:
+- Code that will CRASH or produce WRONG results
+- Missing functionality that was explicitly required
+- Bugs that would be caught by running the code
+
+DO NOT reject for:
+- Style preferences or "best practices" that don't affect correctness
+- Theoretical security concerns when input is already validated
+- Using standard library features (eval, exec, etc.) when the input is sanitized
+- Code that works but could be written differently
+
+CRITICAL: If the code works correctly, APPROVE IT. Working code that uses eval with validated input is better than a broken custom parser. Do not suggest replacements unless the current code is actually broken.
+
+Return STATUS: APPROVED if the code works and meets requirements.
+Return STATUS: NEEDS_REVISION only for ACTUAL BUGS with specific details of what fails and why.
+
+Do NOT include replacement code in your review. Describe the bug, not the fix.""",
 
             AgentRole.TESTER: """⚠️ CRITICAL FORMAT REQUIREMENT ⚠️
 Your output will be saved DIRECTLY as a .py file. The FIRST character MUST be 'i' or 'f' (from 'import' or 'from').
@@ -4689,6 +5385,24 @@ TEST REQUIREMENTS:
 - Every test function needs assertions or 'pass' - NO empty functions
 - Use unittest.mock for file I/O, network calls, datetime, random, etc.
 - For databases: use temp databases or mock connections
+
+═══════════════════════════════════════════════════════════════════════════════
+CRITICAL TEST ISOLATION RULES:
+═══════════════════════════════════════════════════════════════════════════════
+
+- NEVER create class instances at module level (outside functions)
+  WRONG: settings = Settings()  # runs at import time, may crash
+  RIGHT: def test_settings(): settings = Settings()
+- NEVER share variables between test functions via module globals
+  WRONG: metrics = None; def test_a(): global metrics; metrics = collect()
+  RIGHT: Each test creates its own data independently
+- Each test function MUST be self-contained: create its own objects, call its own methods
+- For FastAPI apps, use: from fastapi.testclient import TestClient; client = TestClient(app)
+  NEVER use .test_client() — that is Flask, not FastAPI
+- Mock external dependencies (psutil, subprocess, network, databases) so tests run anywhere
+  Example: @patch('src.collector.psutil.cpu_percent', return_value=50.0)
+- For SQLite databases, use ':memory:' or tempfile.mkstemp() — never write to real files
+- For classes that need Settings, mock or create Settings with test values inside each test
 
 ═══════════════════════════════════════════════════════════════════════════════
 INTERACTIVE INPUT - CRITICAL:
